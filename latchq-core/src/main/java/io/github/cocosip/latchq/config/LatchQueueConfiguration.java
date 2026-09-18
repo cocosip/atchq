@@ -19,11 +19,12 @@ public class LatchQueueConfiguration {
      * before touching storage when exceeded (M0/M1 finding: Chronicle's underlying limit is the
      * appender write buffer, whose usable size is {@code blockSize/2 - 4}; the library derives the
      * block size internally from this setting, so raising it admits bigger messages). Defaults to
-     * 16 MiB. Note that every appender allocates the derived buffer, so very large values multiply
-     * with the number of concurrent writer threads and may require raising {@code
+     * 20 MiB, which comfortably covers the expected workload of sub-megabyte messages with the
+     * occasional larger one. Note that every appender allocates the derived buffer, so very large
+     * values multiply with the number of concurrent writer threads and may require raising {@code
      * -XX:MaxDirectMemorySize}.
      */
-    private long maxMessageSizeBytes = 16L * 1024 * 1024;
+    private long maxMessageSizeBytes = 20L * 1024 * 1024;
 
     /**
      * Chronicle roll cycle name, resolved from the {@code RollCycles} constants. The cycle choice

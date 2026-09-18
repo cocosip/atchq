@@ -68,7 +68,7 @@
 ## 4. M1 实现期发现(补充)
 
 1. **Chronicle 资源单线程约束**:`StoreTailer` 必须在创建它的线程上使用,跨线程使用抛 `ThreadingIllegalStateException`(实测:main 线程 `createTailer()`+`moveToIndex`,scan 虚拟线程读 → 每次读取都抛错)。LatchQ 的 tailer 改为**由 scan 线程自行创建/使用/关闭**;`close()` 可以跨线程。
-2. **单条消息大小上限(M1 实测定案)**:上限 = appender 块大小的一半减 4 字节(`writeRemaining = blockSize/2 - 4`),Chronicle 默认 blockSize 16MB → 默认单条上限 ≈ 16MB,超限报 `DecoratedBufferOverflowException: Length: X > writeRemaining: Y`。**可调**:`builder.blockSize(...)` 实测有效(128MB → writeRemaining 32MB-4)。LatchQ 对外暴露 `maxMessageSizeBytes`(默认 16MB),内部派生 `blockSize = max(16MB, maxMessageSizeBytes*2 + 128)`,并在写入前前置校验,超限抛带明确提示的 `LatchQException`,不产生脏数据。
+2. **单条消息大小上限(M1 实测定案)**:上限 = appender 块大小的一半减 4 字节(`writeRemaining = blockSize/2 - 4`),Chronicle 默认 blockSize 16MB → 默认单条上限 ≈ 16MB,超限报 `DecoratedBufferOverflowException: Length: X > writeRemaining: Y`。**可调**:`builder.blockSize(...)` 实测有效(128MB → writeRemaining 32MB-4)。LatchQ 对外暴露 `maxMessageSizeBytes`(默认 **20MB**,按业务预期"常规 <1MB、偶发略超 1MB"设定),内部派生 `blockSize = max(16MB, maxMessageSizeBytes*2 + 128)`,并在写入前前置校验,超限抛带明确提示的 `LatchQException`,不产生脏数据。
 3. **大消息读取**:弹性预分配缓冲在 32MB 级不可靠,改用 `readBytes(ReadBytesMarshallable)` 回调式精确拷贝(视图自带真实长度),任意大小消息均安全。
 4. **Jackson `StreamReadConstraints`**:Jackson 2.15+ 默认限制单字符串 20M 字符,大 payload 会在**读取侧**被 Jackson 拒绝。LatchQ 内部 ObjectMapper 将 `maxStringLength` 放开(上限统一由 `maxMessageSizeBytes` 在写入侧管控)。
 5. **日志约定**:core 只依赖 `slf4j-api` 2.x 门面,不携带任何绑定实现;测试作用域的 `slf4j-simple` 仅用于测试期日志可见,不会传递给使用方。上层(如 Spring Boot 应用)自行引入 log4j2 等实现。

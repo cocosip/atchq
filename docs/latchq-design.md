@@ -234,7 +234,7 @@ public class LatchQueueOptions {
 
 public class LatchQueueConfiguration {
     private String fileName;                              // 必填,队列目录名
-    private long maxMessageSizeBytes = 16L * 1024 * 1024; // 单条消息序列化后大小上限,超限写入前置拒绝(库内部换算 Chronicle blockSize,可用写空间 = blockSize/2 - 4)
+    private long maxMessageSizeBytes = 20L * 1024 * 1024; // 单条消息序列化后大小上限(默认 20MB,覆盖 1MB 以内的常规消息与偶发大消息),超限写入前置拒绝(库内部换算 Chronicle blockSize,可用写空间 = blockSize/2 - 4)
     private String rollCycle = "DEFAULT";                 // Chronicle 滚动策略(按名称从 RollCycles 常量反射解析),承担 FASTER 版 Capacity/SegmentSizeBits 的容量语义
     private int syncIntervalMillis = 2000;                // 周期性 appender.sync() 刷盘间隔,见下方字段对应说明
     private int completeIntervalMillis = 3000;            // 区间合并任务周期
