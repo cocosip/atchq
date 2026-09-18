@@ -10,6 +10,7 @@ LatchQ 是一个基于 [OpenHFT Chronicle Queue](https://github.com/OpenHFT/Chro
 |---|---|
 | [latchq-design.md](./latchq-design.md) | 设计文档:问题背景、架构、模块划分、核心 API、gap 处理算法、配置模型、技术基线 |
 | [latchq-progress.md](./latchq-progress.md) | 开发计划与进度跟踪:版本基线、里程碑任务分解(含 DoD)、关键决策记录、风险登记 |
+| [spike-notes.md](./spike-notes.md) | M0 技术验证结论:chronicle-queue 5.27ea5 实测 API 差异、index 语义、JDK 21 参数、清理与恢复行为 |
 
 ## 阅读顺序
 

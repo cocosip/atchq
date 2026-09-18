@@ -4,24 +4,24 @@
 
 ## 当前阶段
 
-**设计定稿阶段** — 设计文档已对照 `SharpAbp.Abp.Faster` 源码完成一轮评审并回填修正(v0.2),待用户确认后进入 M0 技术验证。
+**M1 核心读写实现中** — M0 技术验证已完成(10/10 核实用例通过,结论见 [spike-notes.md](./spike-notes.md)),设计文档已回填冻结(v0.3)。
 
 ## 版本与基线(定稿)
 
 | 项 | 值 |
 |---|---|
 | JDK | 21(OpenJDK/Temurin,固定) |
-| Maven | 3.9+ |
-| Chronicle Queue | `net.openhft:chronicle-queue` **5.27ea5**(2026-09 Maven Central 最新社区版,经 chronicle-bom 对齐;M0 spike 若发现阻断性问题则降级 5.26ea 线并更新此表) |
+| Maven | 3.9.16,**项目自带 Maven Wrapper,统一用 `./mvnw` 构建** |
+| Chronicle Queue | `net.openhft:chronicle-queue` **5.27ea5**(M0 实测通过;经 chronicle-bom 对齐) |
 | Jackson | `jackson-databind` 2.20.0(对齐 stow) |
 | 测试栈 | JUnit5 + AssertJ + Mockito + Awaitility |
-| 构建 | 多模块结构、enforcer/spotless/jacoco/flatten 插件配置参照 stow 项目 |
+| 构建 | 多模块结构、enforcer/spotless/jacoco/flatten 插件配置参照 stow 项目;JDK 21 运行需携带 M0 确定的 `--add-opens` 参数(已固化到 surefire argLine) |
 
 ## 里程碑总览
 
 | 里程碑 | 内容 | 前置依赖 | 状态 |
 |---|---|---|---|
-| M0 | 技术验证(spike)与设计冻结 | 设计评审通过 | **未开始(下一步)** |
+| M0 | 技术验证(spike)与设计冻结 | 设计评审通过 | **已完成(2026-09-18,10/10 用例通过)** |
 | M1 | 核心读写(latchq-core 骨架、配置、写入、scan 扇出、read API) | M0 | 未开始 |
 | M2 | 进度与 Gap(区间合并、gap 检测/跳过、checkpoint 持久化与恢复) | M1 | 未开始 |
 | M3 | 清理与导出(cycle 文件清理、export API、metrics 补全) | M2 | 未开始 |
@@ -143,3 +143,4 @@
 ## 进度日志
 
 - 2026-09-18:设计文档 v0.1 完成;对照 `SharpAbp.Abp.Faster` 源码完成评审,设计文档修订至 v0.2;本文档重写为任务分解式开发计划;版本基线定稿(`chronicle-queue 5.27ea5`,JDK 21)。
+- 2026-09-18:**M0 完成**。T0.1~T0.6 全部执行完毕,10/10 验证用例通过(`ChronicleApiVerificationTest`),结论归档 [spike-notes.md](./spike-notes.md) 并回填设计文档第 10 节(v0.3,设计冻结)。关键定案:nextIndex 采用前瞻推导(7.1 路线 2);scan 线程用无名 tailer;JDK 21 需 4 个 `--add-opens` + 1 个 `--add-exports`;旧 cycle 文件可在队列打开时安全删除(`onReleased` 先行)。工程骨架(parent + latchq-core + Maven Wrapper 3.9.16)随本里程碑建立。下一步:M1 核心读写。

@@ -36,3 +36,11 @@ Thumbs.db
 docs/superpowers/
 .superpowers/
 
+
+# Maven and Java IDE output
+target/
+.flattened-pom.xml
+.classpath
+.project
+.settings/
+*.iml

@@ -4,8 +4,8 @@
 
 | 项 | 值 |
 |---|---|
-| 状态 | 设计草案,已对照 FasterLogger 源码完成一轮评审,待用户确认 |
-| 版本 | v0.2 |
+| 状态 | 设计冻结(M0 技术验证完成,待核实项已全部回填) |
+| 版本 | v0.3 |
 | 更新日期 | 2026-09-18 |
 | 参考实现 | [SharpAbp.Abp.Faster](https://github.com/sharpabp/sharp-abp)(基于 Microsoft FASTER 的 .NET 持久化日志库) |
 | 底层依赖 | [OpenHFT Chronicle Queue](https://github.com/OpenHFT/Chronicle-Queue) |
@@ -208,9 +208,7 @@ public interface LatchQueueFactory {
 Chronicle 的 index 高位编码 cycle、低位编码序号:**同一 cycle 内每条消息的序号递增 1,但跨 cycle 边界(滚动)时 index 不连续**。由此:
 
 - **不能**用 `index + 1` 作为 nextIndex——否则每次 roll(按天/按小时滚动)都会制造一个"假 gap":区间合并推不过边界,gap 挂起 2 分钟后被强制跳过,**每次滚动都静默丢一批数据**。这比 FASTER 版的容差问题严重,属于正确性陷阱。
-- Chronicle 的 `DocumentContext`/`ExcerptTailer` **并不直接提供 nextIndex**(只给当前 index),必须自行推导,两条候选路线(M0 spike 定案,见第 10 节):
-  1. **RollCycle 算术推导**:cycle 内取 `toIndex(cycle, seq + 1)`;序号到达该 cycle 上限时取 `toIndex(cycle + 1, 0)`。
-  2. **前瞻推导**:scan 线程读出第 n+1 条时,把其实际 index 回填为第 n 条的 nextIndex;批尾/到达 tail 时未确定的,等下一条到达再补齐后才允许该 Position 参与合并推进。
+- Chronicle 的 `DocumentContext`/`ExcerptTailer` **并不直接提供 nextIndex**(只给当前 index),必须自行推导。**M0 已定案:采用路线 2(前瞻推导)**——scan 线程读出第 n+1 条时,把其实际 index 回填为第 n 条的 nextIndex(scan 线程内部持有 1 条 read-ahead 缓冲),未读到下一条之前该条不投递给消费者;`close()` 时未投递的缓冲直接丢弃(该消息从未被处理,重启后重新扫描)。路线 1(算术推导)经实测在"空闲跨 cycle"场景必然制造假 gap,弃用(实测数据见 [spike-notes.md](./spike-notes.md))。
 - 推导逻辑收敛在独立的纯函数类(如 `IndexCodec`)中,单测必须覆盖跨 cycle 边界用例。
 
 ### 7.2 算法流程
@@ -281,20 +279,24 @@ ExportResult export(String targetDirectory, long fromIndex, Long toIndex, int en
 
 | 依赖 | 说明 |
 |---|---|
-| `net.openhft:chronicle-queue` | 持久化队列底层实现,开源版。**版本基线定稿:5.27ea5**(2026-09 经 Maven Central 核实的最新社区版,JDK 21 官方支持;经 `net.openhft:chronicle-bom` 做版本对齐。若 M0 spike 发现阻断性问题,降级方案为 5.26ea 线) |
+| `net.openhft:chronicle-queue` | 持久化队列底层实现,开源版。**版本基线:5.27ea5**(M0 已验证,JDK 21 下 10/10 核实用例通过;经 `net.openhft:chronicle-bom` 做版本对齐) |
 | `com.fasterxml.jackson.core:jackson-databind` | JSON 序列化,版本对齐参考 stow 项目的 `2.20.0` |
 | `org.slf4j:slf4j-api` | 日志门面 |
 | JUnit5 + AssertJ + Mockito + Awaitility | 测试栈,`Awaitility` 专门用于验证后台任务(如"gap 在超时后被自动跳过""checkpoint 文件最终被更新")这类异步收敛断言 |
 
-**⚠️ 需要在实现阶段用实际引入的 Chronicle Queue 版本核实的技术细节**(以下是设计阶段基于对 Chronicle Queue 已发布 API 的认知给出的工作假设,不是凭空捏造,但精确的方法签名/是否存在自动化辅助 API 需要在写代码前对照当时拉取到的 `chronicle-queue` 版本的 Javadoc/源码逐一确认,并把确认结果补充回本文档):
+构建基线:项目自带 **Maven Wrapper(3.9.16)**,统一用 `./mvnw` 构建,与全局 Maven 解耦;`.flattened-pom.xml`(flatten 插件处理 `${revision}` 的产物)不入库。
 
-1. **多线程写入的线程安全获取方式**:预期通过 `queue.acquireAppender()` 按线程获取独立的 `ExcerptAppender` 实例(Chronicle 官方推荐"每写线程一个 appender 实例")。确认该方法能否直接从多线程安全调用,或需要 LatchQ 自己维护 `ThreadLocal<ExcerptAppender>`。
-2. **获取写入后的 index 与刷盘**:预期通过 `appender.writingDocument()` 返回的 `DocumentContext.index()` 或写入后调用 `appender.lastIndexAppended()`;同时核实 `ExcerptAppender.sync()` 是否存在及其语义(决定 `syncIntervalMillis` 的实现方式)。
-3. **nextIndex 推导与 roll 边界**(新增,最高优先级):验证 7.1 节两条推导路线在真实 RollCycle 下的行为,重点是跨 cycle 边界;确认 `RollCycle.toIndex/indexToSequence/indexToCycle` 的精确语义,以及"同一 cycle 内序号逐条 +1、无空洞"的假设是否成立(含回滚写入不占序号的确认)。
-4. **Tailer 定位恢复**:预期 `ExcerptTailer.moveToIndex(long index)` 可用于从 checkpoint 恢复读取位置(长期稳定 API,置信度高);同时核实其指向已清理区间时的行为,以及空队列上 `queue.firstIndex()` 的表现(启动恢复的钳制依赖它)。
-5. **脏尾部处理**(新增):模拟 kill -9 后 `.cq4` 文件尾部存在半条消息时,tailer/appender 的自愈行为(FASTER 版有专门的"Uninitialized page"恢复分支,Chronicle 侧需确认等价物)。
-6. **旧分段文件清理**:确认 `SingleChronicleQueueBuilder.storeFileListener(...)` 回调时机,以及删除旧 `.cq4` 文件对活跃 tailer 的影响;结合 7.2-7 的整 cycle 粒度删除策略定案。
-7. **JDK 21 兼容性**:Chronicle Queue(经由 `chronicle-core`/`chronicle-bytes`)使用 `sun.misc.Unsafe` 等底层能力,在较新 JDK 上通常需要追加 `--add-opens`/`--add-exports` JVM 参数。需实测确定完整参数列表,写入 `latchq-core`/示例模块的运行说明和测试插件配置(`maven-surefire-plugin`/`maven-failsafe-plugin` 的 `argLine`)。
+**✅ 第 10 节待核实项已全部完成核实(M0,2026-09-18,详见 [spike-notes.md](./spike-notes.md))**,实现必须遵守的结论:
+
+1. **多线程写入**:`createAppender()` 多线程各自调用安全(2000 条并发写全局唯一 index),LatchQ 用 `ThreadLocal<ExcerptAppender>` 封装,无需加锁。注意 5.27ea5 **没有** `acquireAppender()`。
+2. **写入 index 与刷盘**:`DocumentContext.index()` / `appender.lastIndexAppended()` 均可用;`ExcerptAppender.sync()` 存在,`syncIntervalMillis` 定为周期性调用 `appender.sync()`。
+3. **nextIndex 推导与 roll 边界**:陷阱实测成立(空闲跨 cycle 后任何算术推导都猜不中真实下一条 index);同 cycle 内 index 严格 +1 稠密。**已定案采用前瞻推导(7.1 节路线 2)**。
+4. **定位恢复**:`moveToIndex(i)` 定位到 i 这条消息本身;空队列 `firstIndex()` 返回 `Long.MAX_VALUE`(不抛异常),钳制逻辑需处理;**指向空 cycle 的 moveToIndex 会先返回 present-but-empty 的幻影文档** → 恢复只允许用真实消息 index,scan 线程需跳过空文档。
+5. **脏尾部**:kill -9 写一半后,半条消息不可见、已有消息完整可读、队列可继续写入——Chronicle 自愈,无需自建 FASTER 式恢复分支。
+6. **清理**:旧 cycle `.cq4` 文件可在队列打开时删除(Windows 实测成功),删除前该 cycle 的 `onReleased` 已触发;`firstIndex()` 删除后正确前移;**不要按 cycle 反推文件名**,枚举目录处理,删除失败下轮重试。
+7. **JDK 21 JVM 参数**(已固化到根 pom surefire argLine,应用运行说明同样要求):
+   `--add-opens java.base/java.lang=ALL-UNNAMED --add-opens java.base/java.lang.reflect=ALL-UNNAMED --add-opens java.base/java.io=ALL-UNNAMED --add-opens java.base/sun.nio.ch=ALL-UNNAMED --add-exports java.base/jdk.internal.ref=ALL-UNNAMED`
+8. **其他实现约束**(M0 附带发现):scan 线程必须用**无名 tailer**(同名 tailer 会恢复 Chronicle 记住的位置);`RollCycle.defaultIndexCount` 必须 ≥ 单 cycle 消息量;`Bytes` 必须显式 `releaseLast()`;`queue.lastIndex()` 存在,用于 `lastIndexAppended()`。
 
 ## 11. 异常模型
 
@@ -329,5 +331,5 @@ ExportResult export(String targetDirectory, long fromIndex, Long toIndex, int en
 - [x] 确定模块划分、包结构、命名风格。
 - [x] 确定消费进度持久化与 gap 处理策略。
 - [x] 对照参考实现(SharpAbp.Abp.Faster 源码)完成一轮设计评审,修正项已回填(v0.2)。
-- [ ] Chronicle Queue 具体 API 方法签名在实现阶段(M0 spike)逐一核实并回填本文档第 10 节。
-- [ ] 用户审阅本文档(v0.2)并确认可进入 M0 技术验证。
+- [x] Chronicle Queue 具体 API 在 M0 技术验证中核实完毕并回填本文档第 10 节(v0.3,详见 spike-notes.md)。
+- [ ] 用户审阅本文档(v0.3)并确认进入 M1 实现。
