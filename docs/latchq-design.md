@@ -208,7 +208,9 @@ public interface LatchQueueFactory {
 Chronicle 的 index 高位编码 cycle、低位编码序号:**同一 cycle 内每条消息的序号递增 1,但跨 cycle 边界(滚动)时 index 不连续**。由此:
 
 - **不能**用 `index + 1` 作为 nextIndex——否则每次 roll(按天/按小时滚动)都会制造一个"假 gap":区间合并推不过边界,gap 挂起 2 分钟后被强制跳过,**每次滚动都静默丢一批数据**。这比 FASTER 版的容差问题严重,属于正确性陷阱。
-- Chronicle 的 `DocumentContext`/`ExcerptTailer` **并不直接提供 nextIndex**(只给当前 index),必须自行推导。**M0 已定案:采用路线 2(前瞻推导)**——scan 线程读出第 n+1 条时,把其实际 index 回填为第 n 条的 nextIndex(scan 线程内部持有 1 条 read-ahead 缓冲),未读到下一条之前该条不投递给消费者;`close()` 时未投递的缓冲直接丢弃(该消息从未被处理,重启后重新扫描)。路线 1(算术推导)经实测在"空闲跨 cycle"场景必然制造假 gap,弃用(实测数据见 [spike-notes.md](./spike-notes.md))。
+- Chronicle 的 `DocumentContext`/`ExcerptTailer` **并不直接提供 nextIndex**(只给当前 index),必须自行推导。**M0 已定案:采用路线 2(前瞻推导)**,并补充两条投递规则(M1 实现定案):
+  1. **前瞻回填**:scan 线程读出第 n+1 条时,把其实际 index 回填为第 n 条的 nextIndex(scan 线程内部持有 1 条 read-ahead 缓冲)——交付给消费者的位置永远链到真实下一条。
+  2. **追平临时投递**:队列追平(生产者空闲)时,被扣住的尾部条目以"同 cycle 内 `toIndex(cycle, seq+1)` 的临时 nextIndex"立即投递,避免空闲生产者饿死消费者;scan 线程记住该临时值,当真实下一条落点与之不同(空闲期间发生了 roll)时记录一条**空隙修正 `[provisional → real]`**(空隙内没有任何消息),M2 的合并算法遇中与修正完全匹配的 gap 立即跳过(不丢数据、不等强制跳过超时),修正随 checkpoint 持久化。
 - 推导逻辑收敛在独立的纯函数类(如 `IndexCodec`)中,单测必须覆盖跨 cycle 边界用例。
 
 ### 7.2 算法流程
@@ -232,7 +234,8 @@ public class LatchQueueOptions {
 
 public class LatchQueueConfiguration {
     private String fileName;                              // 必填,队列目录名
-    private String rollCycle = "XLARGE_DAILY";            // Chronicle 滚动策略,承担 FASTER 版 Capacity/SegmentSizeBits 的容量语义(具体默认值 M0 spike 定案)
+    private long maxMessageSizeBytes = 16L * 1024 * 1024; // 单条消息序列化后大小上限,超限写入前置拒绝(库内部换算 Chronicle blockSize,可用写空间 = blockSize/2 - 4)
+    private String rollCycle = "DEFAULT";                 // Chronicle 滚动策略(按名称从 RollCycles 常量反射解析),承担 FASTER 版 Capacity/SegmentSizeBits 的容量语义
     private int syncIntervalMillis = 2000;                // 周期性 appender.sync() 刷盘间隔,见下方字段对应说明
     private int completeIntervalMillis = 3000;            // 区间合并任务周期
     private int checkpointIntervalMillis = 2000;          // checkpoint 落盘周期
@@ -241,7 +244,7 @@ public class LatchQueueConfiguration {
     private int gapTimeoutMillis = 600000;                // gap 首次告警延迟与重复告警周期(默认 10 分钟)
     private int forceCompleteGapTimeoutMillis = 120000;   // gap 强制跳过超时(默认 2 分钟,0=关闭)
     private int maxCompletedRanges = 10000;               // 区间集合内存保护上限,超限同样触发强制跳过(见 7.2-4)
-    // builderCustomizer:Consumer<SingleChronicleQueueBuilder>,高级调优钩子,等价 FASTER 版 Configure 闭包
+    // builderCustomizer:Consumer<SingleChronicleQueueBuilder>,高级调优钩子(在 blockSize/rollCycle 之后应用,可覆盖一切)
 }
 ```
 
@@ -279,9 +282,9 @@ ExportResult export(String targetDirectory, long fromIndex, Long toIndex, int en
 
 | 依赖 | 说明 |
 |---|---|
-| `net.openhft:chronicle-queue` | 持久化队列底层实现,开源版。**版本基线:5.27ea5**(M0 已验证,JDK 21 下 10/10 核实用例通过;经 `net.openhft:chronicle-bom` 做版本对齐) |
-| `com.fasterxml.jackson.core:jackson-databind` | JSON 序列化,版本对齐参考 stow 项目的 `2.20.0` |
-| `org.slf4j:slf4j-api` | 日志门面 |
+| `net.openhft:chronicle-queue` | 持久化队列底层实现,开源版。**版本基线:5.27ea5**(M0 已验证,JDK 21 下核实用例通过;经 `net.openhft:chronicle-bom` 做版本对齐) |
+| `com.fasterxml.jackson.core:jackson-databind` | JSON 序列化,版本对齐参考 stow 项目的 `2.20.0`;内部 ObjectMapper 放开 `StreamReadConstraints` 字符串上限(单条大小统一由 `maxMessageSizeBytes` 在写入侧管控) |
+| `org.slf4j:slf4j-api` | 日志门面,固定 2.x;**core 及 starter 不携带任何 slf4j 绑定实现**,实现(如 log4j2)由上层应用自行提供 |
 | JUnit5 + AssertJ + Mockito + Awaitility | 测试栈,`Awaitility` 专门用于验证后台任务(如"gap 在超时后被自动跳过""checkpoint 文件最终被更新")这类异步收敛断言 |
 
 构建基线:项目自带 **Maven Wrapper(3.9.16)**,统一用 `./mvnw` 构建,与全局 Maven 解耦;`.flattened-pom.xml`(flatten 插件处理 `${revision}` 的产物)不入库。

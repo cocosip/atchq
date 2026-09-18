@@ -91,7 +91,7 @@
                     <artifactId>maven-surefire-plugin</artifactId>
                     <version>3.5.2</version>
                     <configuration>
-                        <!-- T0.6 结论:JDK 21 运行 Chronicle 所需的最小 JVM 开放参数(见 docs/spike-notes.md) -->
+                        <!-- T0.6 finding: minimal JVM opens required by Chronicle on JDK 21 (see docs/spike-notes.md) -->
                         <argLine>@{argLine}
                             --add-opens java.base/java.lang=ALL-UNNAMED
                             --add-opens java.base/java.lang.reflect=ALL-UNNAMED

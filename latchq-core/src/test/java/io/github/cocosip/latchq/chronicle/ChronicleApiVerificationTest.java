@@ -32,10 +32,10 @@ import net.openhft.chronicle.wire.DocumentContext;
 import org.junit.jupiter.api.Test;
 
 /**
- * Formal regression baseline for the M0 technical verification (the "to be verified" items
- * in section 10 of the design document): validates chronicle-queue 5.27ea5 behaviour on
- * JDK 21 - concurrent writes, index semantics, roll boundaries, restore positioning,
- * cycle file cleanup and dirty-tail self healing. Findings are recorded in docs/spike-notes.md.
+ * Formal regression baseline for the M0 technical verification (the "to be verified" items in
+ * section 10 of the design document): validates chronicle-queue 5.27ea5 behaviour on JDK 21 -
+ * concurrent writes, index semantics, roll boundaries, restore positioning, cycle file cleanup and
+ * dirty-tail self healing. Findings are recorded in docs/spike-notes.md.
  */
 class ChronicleApiVerificationTest {
 
@@ -44,21 +44,24 @@ class ChronicleApiVerificationTest {
     private static final AtomicInteger TAILER_SEQ = new AtomicInteger();
 
     /**
-     * Not using {@code @TempDir}: on Windows Chronicle releases .cq4 file handles shortly
-     * after queue close, so JUnit's temp directory cleanup fails intermittently. Test data
-     * lives under target/test-data and is wiped by mvn clean instead.
+     * Not using {@code @TempDir}: on Windows Chronicle releases .cq4 file handles shortly after
+     * queue close, so JUnit's temp directory cleanup fails intermittently. Test data lives under
+     * target/test-data and is wiped by mvn clean instead.
      */
     private static Path dir(String name) {
         Path path = Path.of("target", "test-data", name);
         if (Files.exists(path)) {
             try {
-                Files.walk(path).sorted(Comparator.reverseOrder()).forEach(p -> {
-                    try {
-                        Files.delete(p);
-                    } catch (IOException ignored) {
-                        // left-over locked file from a previous run, ignore
-                    }
-                });
+                Files.walk(path)
+                        .sorted(Comparator.reverseOrder())
+                        .forEach(
+                                p -> {
+                                    try {
+                                        Files.delete(p);
+                                    } catch (IOException ignored) {
+                                        // left-over locked file from a previous run, ignore
+                                    }
+                                });
             } catch (IOException ignored) {
                 // ignore
             }
@@ -75,7 +78,8 @@ class ChronicleApiVerificationTest {
         return LocalDate.now().atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli();
     }
 
-    private static ChronicleQueue queue(Path path, RollCycle rollCycle, Long epoch, StoreFileListener listener) {
+    private static ChronicleQueue queue(
+            Path path, RollCycle rollCycle, Long epoch, StoreFileListener listener) {
         var builder = ChronicleQueue.singleBuilder(path.toString()).rollCycle(rollCycle);
         if (epoch != null) {
             builder.epoch(epoch);
@@ -87,7 +91,8 @@ class ChronicleApiVerificationTest {
     }
 
     private static byte[] payload(long i) {
-        return ("{\"id\":" + i + ",\"pad\":\"" + "p".repeat(24) + "\"}").getBytes(StandardCharsets.UTF_8);
+        return ("{\"id\":" + i + ",\"pad\":\"" + "p".repeat(24) + "\"}")
+                .getBytes(StandardCharsets.UTF_8);
     }
 
     private static long append(ExcerptAppender appender, byte[] data) {
@@ -103,7 +108,8 @@ class ChronicleApiVerificationTest {
         List<Read> reads = new ArrayList<>();
         // Finding: a tailer created with a previously used name resumes the position
         // Chronicle remembered for it, so every read pass needs a unique name.
-        try (ExcerptTailer tailer = queue.createTailer("verification-" + TAILER_SEQ.incrementAndGet())) {
+        try (ExcerptTailer tailer =
+                queue.createTailer("verification-" + TAILER_SEQ.incrementAndGet())) {
             if (fromIndex >= 0) {
                 tailer.moveToIndex(fromIndex);
             }
@@ -157,16 +163,18 @@ class ChronicleApiVerificationTest {
             CountDownLatch start = new CountDownLatch(1);
             List<Future<List<Long>>> futures = new ArrayList<>();
             for (int t = 0; t < threads; t++) {
-                futures.add(pool.submit(() -> {
-                    start.await();
-                    List<Long> indexes = new ArrayList<>(perThread);
-                    try (ExcerptAppender appender = queue.createAppender()) {
-                        for (int i = 0; i < perThread; i++) {
-                            indexes.add(append(appender, payload(i)));
-                        }
-                    }
-                    return indexes;
-                }));
+                futures.add(
+                        pool.submit(
+                                () -> {
+                                    start.await();
+                                    List<Long> indexes = new ArrayList<>(perThread);
+                                    try (ExcerptAppender appender = queue.createAppender()) {
+                                        for (int i = 0; i < perThread; i++) {
+                                            indexes.add(append(appender, payload(i)));
+                                        }
+                                    }
+                                    return indexes;
+                                }));
             }
             start.countDown();
 
@@ -181,7 +189,8 @@ class ChronicleApiVerificationTest {
 
             List<Read> reads = readAll(queue, -1);
             assertThat(reads).hasSize(threads * perThread);
-            // Index order within a thread equals write order; the global readback covers all indexes.
+            // Index order within a thread equals write order; the global readback covers all
+            // indexes.
             assertThat(reads.stream().mapToLong(Read::index).boxed().toList())
                     .containsExactlyInAnyOrderElementsOf(all);
         }
@@ -223,8 +232,11 @@ class ChronicleApiVerificationTest {
                 long emptyFirst = queue.firstIndex();
                 System.out.println("[verify] empty firstIndex=" + emptyFirst);
             } catch (RuntimeException e) {
-                System.out.println("[verify] empty firstIndex threw "
-                        + e.getClass().getSimpleName() + ": " + e.getMessage());
+                System.out.println(
+                        "[verify] empty firstIndex threw "
+                                + e.getClass().getSimpleName()
+                                + ": "
+                                + e.getMessage());
             }
             try (ExcerptAppender appender = queue.createAppender()) {
                 first = append(appender, payload(0));
@@ -260,8 +272,15 @@ class ChronicleApiVerificationTest {
             // arithmetic predicts the real next message index after an idle gap.
             assertThat(i2).isNotEqualTo(i1 + 1);
             assertThat(i2).isNotEqualTo(TINY.toIndex(c1 + 1, 0));
-            System.out.println("[verify] idle skip: m1(cycle=" + c1 + ") m2(cycle=" + c2
-                    + ") routeA(m1)=" + TINY.toIndex(c1 + 1, 0) + " actual=" + i2);
+            System.out.println(
+                    "[verify] idle skip: m1(cycle="
+                            + c1
+                            + ") m2(cycle="
+                            + c2
+                            + ") routeA(m1)="
+                            + TINY.toIndex(c1 + 1, 0)
+                            + " actual="
+                            + i2);
         }
     }
 
@@ -289,7 +308,8 @@ class ChronicleApiVerificationTest {
                     // Ordinary boundary without idle: sequence restarts at 0 in the new cycle.
                     assertThat(TINY.toSequenceNumber(current)).isEqualTo(0);
                 } else {
-                    System.out.println("[verify] idle skip inside continuous run " + pc + "->" + cc);
+                    System.out.println(
+                            "[verify] idle skip inside continuous run " + pc + "->" + cc);
                 }
             }
             assertThat(boundaries).isGreaterThanOrEqualTo(1);
@@ -327,9 +347,19 @@ class ChronicleApiVerificationTest {
             }
             long emptyCycleIndex = TINY.toIndex(TINY.toCycle(i1) + 1, 0);
             List<Read> reads = readAll(queue, emptyCycleIndex);
-            System.out.println("[verify] moveToIndex(emptyCycle) -> reads=" + reads.stream()
-                    .map(r -> r.index() + (r.data() == null || r.data().length == 0 ? "(EMPTY)" : ""))
-                    .toList() + " expect i2=" + i2);
+            System.out.println(
+                    "[verify] moveToIndex(emptyCycle) -> reads="
+                            + reads.stream()
+                                    .map(
+                                            r ->
+                                                    r.index()
+                                                            + (r.data() == null
+                                                                            || r.data().length == 0
+                                                                    ? "(EMPTY)"
+                                                                    : ""))
+                                    .toList()
+                            + " expect i2="
+                            + i2);
             // Finding: moveToIndex into an empty cycle may first return a present-but-empty
             // phantom document at exactly the requested index, then continue forward to real
             // data. LatchQ restore must therefore only use indexes of real messages.
@@ -347,17 +377,18 @@ class ChronicleApiVerificationTest {
         Path path = dir("cleanup");
         Map<Integer, File> acquired = new ConcurrentHashMap<>();
         Map<Integer, File> released = new ConcurrentHashMap<>();
-        StoreFileListener listener = new StoreFileListener() {
-            @Override
-            public void onAcquired(int cycle, File file) {
-                acquired.put(cycle, file);
-            }
+        StoreFileListener listener =
+                new StoreFileListener() {
+                    @Override
+                    public void onAcquired(int cycle, File file) {
+                        acquired.put(cycle, file);
+                    }
 
-            @Override
-            public void onReleased(int cycle, File file) {
-                released.put(cycle, file);
-            }
-        };
+                    @Override
+                    public void onReleased(int cycle, File file) {
+                        released.put(cycle, file);
+                    }
+                };
 
         try (ChronicleQueue queue = queue(path, TINY, epoch(), listener)) {
             long i1;
@@ -383,13 +414,18 @@ class ChronicleApiVerificationTest {
             // .cq4 file in the directory.
             File[] cq4Files = path.toFile().listFiles((d, name) -> name.endsWith(".cq4"));
             assertThat(cq4Files).isNotNull();
-            File oldFile = Arrays.stream(cq4Files)
-                    .min(Comparator.comparingLong(File::lastModified))
-                    .orElseThrow();
+            File oldFile =
+                    Arrays.stream(cq4Files)
+                            .min(Comparator.comparingLong(File::lastModified))
+                            .orElseThrow();
             System.out.println("[verify] oldest cycle file=" + oldFile.getName());
             boolean deleted = oldFile.delete();
-            System.out.println("[verify] old cycle file delete while queue open: " + deleted
-                    + " (released before delete? " + released.containsKey(c1) + ")");
+            System.out.println(
+                    "[verify] old cycle file delete while queue open: "
+                            + deleted
+                            + " (released before delete? "
+                            + released.containsKey(c1)
+                            + ")");
 
             // Whatever the delete outcome, the queue keeps working for both write and read.
             long i4;
@@ -408,9 +444,68 @@ class ChronicleApiVerificationTest {
                 System.out.println("[verify] firstIndex after delete=" + queue.firstIndex());
             }
         }
-        System.out.println("[verify] storeFileListener acquired=" + acquired.keySet()
-                + " released=" + released.keySet());
+        System.out.println(
+                "[verify] storeFileListener acquired="
+                        + acquired.keySet()
+                        + " released="
+                        + released.keySet());
         assertThat(acquired).isNotEmpty();
+    }
+
+    // ------------------------------------------------------------------
+    // message size limit discovery (single entries must not silently fail to write)
+    // ------------------------------------------------------------------
+
+    @Test
+    void largeSingleMessagesRoundTrip() {
+        Path path = dir("largemessage");
+        // M0 finding: the default appender write buffer caps a single message at ~16 MiB
+        // (DecoratedBufferOverflowException "Length: X > writeRemaining: 16777212").
+        // LatchQueueConfiguration.blockSizeBytes lifts the cap via builder.blockSize(...).
+        long[] sizes = {1024, 64L * 1024, 1024 * 1024, 8L * 1024 * 1024};
+        try (ChronicleQueue queue = queue(path, TINY, epoch(), null)) {
+            for (long size : sizes) {
+                byte[] data = new byte[(int) size];
+                Arrays.fill(data, (byte) 'x');
+                data[0] = '{';
+                data[(int) size - 1] = '}';
+                long index;
+                try (ExcerptAppender appender = queue.createAppender()) {
+                    index = append(appender, data);
+                }
+                List<Read> reads = readAll(queue, index);
+                if (reads.size() == 1 && Arrays.equals(reads.get(0).data(), data)) {
+                    System.out.println(
+                            "[verify] message size " + size + " bytes: OK (index=" + index + ")");
+                } else {
+                    System.out.println(
+                            "[verify] message size "
+                                    + size
+                                    + " bytes: READBACK MISMATCH, reads="
+                                    + reads.size()
+                                    + " readBytes="
+                                    + (reads.isEmpty() ? -1 : reads.get(0).data().length));
+                }
+            }
+        }
+
+        // control experiment: does builder.blockSize() lift the per-message cap?
+        try (ChronicleQueue queue =
+                ChronicleQueue.singleBuilder(path.resolve("blocksize").toString())
+                        .rollCycle(TINY)
+                        .epoch(epoch())
+                        .blockSize(128L * 1024 * 1024)
+                        .build()) {
+            byte[] data = new byte[32 * 1024 * 1024];
+            Arrays.fill(data, (byte) 'y');
+            try (ExcerptAppender appender = queue.createAppender()) {
+                long index = append(appender, data);
+                System.out.println(
+                        "[verify] 32MiB message with blockSize=128MiB: OK (index=" + index + ")");
+            } catch (Exception e) {
+                System.out.println("[verify] 32MiB message with blockSize=128MiB: FAILED - " + e);
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -421,22 +516,34 @@ class ChronicleApiVerificationTest {
     void hardKillMidWriteLeavesRecoverableQueue() throws Exception {
         Path path = dir("dirtytail");
         int normalMessages = 20;
-        String javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator
-                + (System.getProperty("os.name").toLowerCase().contains("win") ? "java.exe" : "java");
-        Process child = new ProcessBuilder(
-                        javaBin,
-                        "--add-opens", "java.base/java.lang=ALL-UNNAMED",
-                        "--add-opens", "java.base/java.lang.reflect=ALL-UNNAMED",
-                        "--add-opens", "java.base/java.io=ALL-UNNAMED",
-                        "--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED",
-                        "--add-exports", "java.base/jdk.internal.ref=ALL-UNNAMED",
-                        "-cp",
-                        System.getProperty("java.class.path"),
-                        "io.github.cocosip.latchq.chronicle.TornWriteChild",
-                        path.toString(),
-                        String.valueOf(normalMessages))
-                .redirectErrorStream(true)
-                .start();
+        String javaBin =
+                System.getProperty("java.home")
+                        + File.separator
+                        + "bin"
+                        + File.separator
+                        + (System.getProperty("os.name").toLowerCase().contains("win")
+                                ? "java.exe"
+                                : "java");
+        Process child =
+                new ProcessBuilder(
+                                javaBin,
+                                "--add-opens",
+                                "java.base/java.lang=ALL-UNNAMED",
+                                "--add-opens",
+                                "java.base/java.lang.reflect=ALL-UNNAMED",
+                                "--add-opens",
+                                "java.base/java.io=ALL-UNNAMED",
+                                "--add-opens",
+                                "java.base/sun.nio.ch=ALL-UNNAMED",
+                                "--add-exports",
+                                "java.base/jdk.internal.ref=ALL-UNNAMED",
+                                "-cp",
+                                System.getProperty("java.class.path"),
+                                "io.github.cocosip.latchq.chronicle.TornWriteChild",
+                                path.toString(),
+                                String.valueOf(normalMessages))
+                        .redirectErrorStream(true)
+                        .start();
         assertThat(child.getInputStream().readAllBytes()).asString().contains("child: wrote");
         boolean finished = child.waitFor(60, TimeUnit.SECONDS);
         assertThat(finished).isTrue();
@@ -444,8 +551,12 @@ class ChronicleApiVerificationTest {
 
         try (ChronicleQueue queue = queue(path, TINY, null, null)) {
             List<Read> reads = readAll(queue, -1);
-            System.out.println("[verify] after hard kill: readable=" + reads.size()
-                    + " (expect " + normalMessages + ", torn tail must not appear)");
+            System.out.println(
+                    "[verify] after hard kill: readable="
+                            + reads.size()
+                            + " (expect "
+                            + normalMessages
+                            + ", torn tail must not appear)");
             assertThat(reads).hasSize(normalMessages);
             assertThat(new String(reads.get(reads.size() - 1).data(), StandardCharsets.UTF_8))
                     .contains("\"id\":" + (normalMessages - 1));

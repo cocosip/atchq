@@ -20,8 +20,8 @@ public final class TinyRollCycle implements RollCycle {
 
     @Override
     public int defaultIndexCount() {
-        // 索引容量必须覆盖单个 cycle 内的消息量,否则写入时报
-        // "Unable to index N, the number of entries exceeds max number for the current rollcycle"
+        // The index capacity must cover the per-cycle message volume, otherwise writes fail with
+        // "Unable to index N, the number of entries exceeds max number for the current rollcycle".
         return 1 << 16;
     }
 

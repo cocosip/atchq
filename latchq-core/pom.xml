@@ -51,5 +51,12 @@
             <artifactId>mockito-core</artifactId>
             <scope>test</scope>
         </dependency>
+        <!-- makes Chronicle/LatchQ internal log output (incl. scan loop errors) visible in tests -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>${slf4j.version}</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 </project>
