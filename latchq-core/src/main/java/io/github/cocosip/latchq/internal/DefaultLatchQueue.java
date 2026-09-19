@@ -974,7 +974,10 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                             + Math.round(
                                     (double) (fileTime - anchorTime)
                                             / rollCycle().lengthInMillis());
-            if (cycle >= 0 && cycle < checkpointCycle) {
+            // one-cycle safety margin: the name-based derivation can be off by one cycle when
+            // a DST transition lies between the anchor and the target file, and deleting the
+            // checkpoint cycle itself would abandon unprocessed messages
+            if (cycle >= 0 && cycle < checkpointCycle - 1) {
                 try {
                     Files.delete(file.toPath());
                     LOG.info(

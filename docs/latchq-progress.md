@@ -4,7 +4,7 @@
 
 ## 当前阶段
 
-**M3 清理与导出实现中** — M0 技术验证、M1 核心读写、M2 进度与 Gap 均已完成并提交,55 用例全绿。
+**全部里程碑(M0~M5)已完成,最终代码走查通过** — 67 用例全绿,`mvnw verify`(测试 + jacoco + spotless)通过。
 
 ## 版本与基线(定稿)
 
@@ -26,7 +26,7 @@
 | M2 | 进度与 Gap(区间合并、gap 检测/跳过、checkpoint 持久化与恢复) | M1 | **已完成(2026-09-19,55 用例全绿)** |
 | M3 | 清理与导出(cycle 文件清理、export API、metrics 补全) | M2 | **已完成(2026-09-19,61 用例全绿)** |
 | M4 | Spring Boot Starter 与示例(自动配置、两个 sample) | M2 | **已完成(2026-09-19,64 用例全绿,示例实测跑通)** |
-| M5 | 测试、基准与发布准备(并发/崩溃/roll 边界测试、JMH、文档) | M1~M4 | 未开始 |
+| M5 | 测试、基准与发布准备(并发/崩溃/roll 边界测试、JMH、文档) | M1~M4 | **已完成(2026-09-19,67 用例全绿)** |
 
 > 单人开发按 M0→M1→M2→M3→M4→M5 顺序推进;M3 与 M4 无相互依赖,如有多人可并行。
 
@@ -148,3 +148,5 @@
 - 2026-09-19:**M2 完成**。`commit()` 校验(无效/过期/跨界忽略)、区间合并(两阶段加锁)、gap 告警与强制跳过(超时与区间数超限两条件独立)、`forceCommitGap()`、`CheckpointStore` 原子写(temp+fsync+atomic move)、启动恢复(checkpoint 钳制 firstIndex + 修正随 checkpoint 持久化 + 种子修正)。修复一处对照 FASTER 源码发现的合并 bug:强制跳过应推进到 `range.end()` 而非 `range.start()`。55 用例全绿。下一步:M3 清理与导出。
 - 2026-09-19:**M3 完成**。cycle 文件清理落地:只删"整 cycle 早于**已持久化 checkpoint**"的文件(persistedTruncate 由 checkpoint 任务成功写盘后更新),未打开过的旧文件用文件名差值法换算 cycle(时区偏移在差值中抵消,规避 M0 命名陷阱);删除失败容忍重试。`export()` 落地:独立 tailer、fromIndex 钳制、`[from, to)` 语义、按 entriesPerFile 分文件、文件名防碰撞、空结果 toIndex==fromIndex。新发现:`queue.firstIndex()` 会话内缓存,清理后滞后直至重开(已记录文档)。61 用例全绿。下一步:M4 Spring Boot Starter。
 - 2026-09-19:**M4 完成**。`latchq-spring-boot-starter` 落地:`@ConfigurationProperties(prefix="latchq")` 绑定、AutoConfiguration.imports 注册、factory Bean(destroyMethod=close)随应用关闭做最终 checkpoint、`latchq.enabled` 开关;工厂补"关闭后 getOrCreate 抛异常"语义(测试暴露的真实缺陷)。两个示例落地并实测:console(100 写/100 读/100 提交收敛)与 spring-boot(YAML 配置 + Controller 包 export);示例运行需 MAVEN_OPTS 携带 JVM opens(已在 samples/README.md 记录)。修复:后台循环在 shutdown interrupt 落在文件 I/O 中间时静默退出,不再刷 ERROR。64 用例全绿。下一步:M5 测试、基准与文档。
+- 2026-09-19:**M5 完成**。专项测试:并发长跑(3 写 4 读 + 故意停顿制造真实 gap 后恢复,不重不漏)、roll 边界专项(40 条跨多个 1 秒 cycle 位置单调不回退)、LatchQ 层崩溃矩阵(子进程经 LatchQueue API 写 30 条并 commit、checkpoint 落盘后 kill -9,重开不重复投递且可继续写);`latchq-benchmarks` JMH 模块(write/batchWrite/read,手动运行);根 README(快速上手 + JDK 21 参数 + 配置表)。67 用例全绿。
+- 2026-09-19:**最终代码走查完成**。逐类审查核心并发代码后修复 2 处:① 工厂 `getOrCreate` 与 `close()` 的创建竞态——并发时新建队列漏关,改为创建后复查、已关闭则补关并抛异常;② 清理目录扫描的文件名差值法在夏令时切换时 cycle 换算可能偏差 ±1,极端情况会误删 checkpoint 所在 cycle,增加一个 cycle 的安全余量(精确映射分支不受影响)。审查确认的关键正确性点:合并的两阶段加锁无跨 I/O 持锁;commit/merge 的 stale 判定竞态无害(多出的 range 下轮合并消化);清理的 cycle 单调性依据成立(高 cycle ⇒ 高 index);checkpoint 原子写(temp+fsync+move)与最终 checkpoint 时序正确;export 的幻影文档防御与空结果语义正确。已知可接受限制:ThreadLocal appender 在短命写线程反复创建时资源累积至队列关闭才释放(长命线程池场景无影响)。修复后全量 verify 通过。

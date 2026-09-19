@@ -44,6 +44,13 @@ public final class DefaultLatchQueueFactory implements LatchQueueFactory {
                         key ->
                                 createAndInitialize(
                                         name, key.type(), options.getConfiguration(name)));
+        if (closed) {
+            // close() ran concurrently with the creation above: the new queue missed the
+            // shutdown sweep, so close it here instead of leaking it
+            queue.close();
+            throw new io.github.cocosip.latchq.exception.LatchQException(
+                    "the latchq factory was closed while creating queue '" + name + "'");
+        }
         // Cast is safe because the cache key pins the exact payload type.
         return (LatchQueue<T>) queue;
     }
