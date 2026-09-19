@@ -17,9 +17,12 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -29,6 +32,7 @@ import net.openhft.chronicle.queue.ChronicleQueue;
 import net.openhft.chronicle.queue.ExcerptAppender;
 import net.openhft.chronicle.queue.ExcerptTailer;
 import net.openhft.chronicle.queue.RollCycle;
+import net.openhft.chronicle.queue.impl.StoreFileListener;
 import net.openhft.chronicle.wire.DocumentContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,7 +79,21 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
     private Thread scanThread;
     private Thread completeThread;
     private Thread checkpointThread;
+    private Thread cleanupThread;
     private volatile boolean running;
+
+    /**
+     * Files opened by this session, keyed by cycle (populated through the store file listener).
+     * Cleanup deletes entries whose cycle is entirely behind the persisted checkpoint.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<Integer, java.io.File> acquiredCycleFiles =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Truncate index as of the last successful checkpoint write; cleanup must only rely on this
+     * persisted value, never on the in-memory truncate index.
+     */
+    private final AtomicLong persistedTruncate = new AtomicLong(-1);
 
     private final ArrayBlockingQueue<BufferedLogEntry> pending;
     private final ReadAheadStamper stamper = new ReadAheadStamper();
@@ -188,7 +206,21 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             var builder =
                     ChronicleQueue.singleBuilder(queueDirectory.toString())
                             .rollCycle(rollCycle)
-                            .blockSize(blockSize);
+                            .blockSize(blockSize)
+                            .storeFileListener(
+                                    new StoreFileListener() {
+                                        @Override
+                                        public void onAcquired(int cycle, java.io.File file) {
+                                            acquiredCycleFiles.put(cycle, file);
+                                        }
+
+                                        @Override
+                                        public void onReleased(int cycle, java.io.File file) {
+                                            // kept in the map: released files are still deletable
+                                            // by
+                                            // the cleanup rule below the persisted checkpoint
+                                        }
+                                    });
             if (configuration.getBuilderCustomizer() != null) {
                 configuration.getBuilderCustomizer().accept(builder);
             }
@@ -216,6 +248,7 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                 restore = safeFirstIndex();
             }
             truncateBeforeIndex.set(restore);
+            persistedTruncate.set(checkpoint != null ? checkpoint.truncate() : -1);
             // seed correction: the first real read after a restart that lands past the seed
             // index proves the range [seed, index) holds no messages, bridging a provisional
             // checkpoint across an idle roll
@@ -236,6 +269,8 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                     Thread.ofVirtual()
                             .name("latchq-checkpoint-" + name)
                             .start(this::checkpointLoop);
+            this.cleanupThread =
+                    Thread.ofVirtual().name("latchq-cleanup-" + name).start(this::cleanupLoop);
             this.initialized = true;
             LOG.info(
                     "LatchQueue '{}' for type {} initialized, directory={}, restoreIndex={}, rollCycle={}",
@@ -261,7 +296,8 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             closed = true;
         }
         running = false;
-        for (Thread thread : new Thread[] {scanThread, completeThread, checkpointThread}) {
+        for (Thread thread :
+                new Thread[] {scanThread, completeThread, checkpointThread, cleanupThread}) {
             if (thread != null) {
                 thread.interrupt();
                 try {
@@ -810,9 +846,10 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
     /** Background checkpoint task: periodically persists the truncate index atomically. */
     private void checkpointLoop() {
         while (running && !closed) {
+            long truncate = truncateBeforeIndex.get();
             try {
-                checkpointStore.write(
-                        truncateBeforeIndex.get(), java.util.Map.copyOf(emptyGapCorrections));
+                checkpointStore.write(truncate, java.util.Map.copyOf(emptyGapCorrections));
+                persistedTruncate.set(truncate);
             } catch (Exception e) {
                 LOG.error("LatchQueue '{}' checkpoint write failed", name, e);
             }
@@ -826,14 +863,234 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
     }
 
     // ------------------------------------------------------------------
-    // export (implemented in milestone M3)
+    // cycle file cleanup
+    // ------------------------------------------------------------------
+
+    /** Background cleanup task: deletes cycle files fully behind the persisted checkpoint. */
+    private void cleanupLoop() {
+        while (running && !closed) {
+            try {
+                cleanupCycleFiles();
+            } catch (Exception e) {
+                LOG.error("LatchQueue '{}' cycle cleanup failed", name, e);
+            }
+            try {
+                Thread.sleep(configuration.getCleanupIntervalMillis());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    /**
+     * Deletes {@code .cq4} cycle files whose messages are all behind the persisted checkpoint. A
+     * whole cycle is deletable once its cycle number is below the checkpoint's cycle; the
+     * checkpoint - not the in-memory truncate index - is authoritative so that "delete then crash"
+     * can never lose data beyond the persisted progress. Failures (e.g. Windows holds a file handle
+     * briefly after close) are tolerated and retried on the next tick.
+     */
+    private void cleanupCycleFiles() {
+        long persisted = persistedTruncate.get();
+        if (persisted < 0) {
+            return; // nothing persisted yet: never delete based on memory state alone
+        }
+        int checkpointCycle = rollCycle().toCycle(persisted);
+        for (Map.Entry<Integer, java.io.File> entry : acquiredCycleFiles.entrySet()) {
+            int cycle = entry.getKey();
+            if (cycle >= checkpointCycle) {
+                continue;
+            }
+            java.io.File file = entry.getValue();
+            try {
+                Files.delete(file.toPath());
+                acquiredCycleFiles.remove(cycle);
+                LOG.info(
+                        "LatchQueue '{}' deleted consumed cycle file {} (cycle {})",
+                        name,
+                        file,
+                        cycle);
+            } catch (IOException e) {
+                // transient lock, retried on the next tick
+                LOG.debug("LatchQueue '{}' could not delete cycle file {} yet", name, file, e);
+            }
+        }
+        cleanupUnopenedFiles(checkpointCycle);
+    }
+
+    /**
+     * Sweeps cycle files that were never opened in this session (e.g. written by an earlier run and
+     * never re-read). Their cycle number is derived from the file name relative to an acquired
+     * anchor file: parsing both names with any fixed timezone cancels the unknown timezone offset,
+     * so the cycle difference is exact without depending on Chronicle's naming internals (see the
+     * M0 findings in docs/spike-notes.md).
+     */
+    private void cleanupUnopenedFiles(int checkpointCycle) {
+        if (acquiredCycleFiles.isEmpty()) {
+            return;
+        }
+        Map.Entry<Integer, java.io.File> anchor =
+                java.util.Collections.max(
+                        acquiredCycleFiles.entrySet(), Map.Entry.comparingByKey());
+        java.text.SimpleDateFormat parser = new java.text.SimpleDateFormat(rollCycle().format());
+        parser.setLenient(false);
+        long anchorTime;
+        try {
+            anchorTime = parser.parse(stripCq4Extension(anchor.getValue().getName())).getTime();
+        } catch (java.text.ParseException e) {
+            LOG.debug(
+                    "LatchQueue '{}' cannot parse anchor file name {}, skipping sweep",
+                    name,
+                    anchor.getValue());
+            return;
+        }
+        java.io.File[] candidates =
+                queueDirectory.toFile().listFiles((dir, fileName) -> fileName.endsWith(".cq4"));
+        if (candidates == null) {
+            return;
+        }
+        for (java.io.File file : candidates) {
+            if (acquiredCycleFiles.containsValue(file)) {
+                continue;
+            }
+            long fileTime;
+            try {
+                fileTime = parser.parse(stripCq4Extension(file.getName())).getTime();
+            } catch (java.text.ParseException e) {
+                LOG.debug("LatchQueue '{}' ignoring unparseable file name {}", name, file);
+                continue;
+            }
+            long cycle =
+                    anchor.getKey()
+                            + Math.round(
+                                    (double) (fileTime - anchorTime)
+                                            / rollCycle().lengthInMillis());
+            if (cycle >= 0 && cycle < checkpointCycle) {
+                try {
+                    Files.delete(file.toPath());
+                    LOG.info(
+                            "LatchQueue '{}' deleted consumed cycle file {} (cycle {})",
+                            name,
+                            file,
+                            cycle);
+                } catch (IOException e) {
+                    LOG.debug("LatchQueue '{}' could not delete cycle file {} yet", name, file, e);
+                }
+            }
+        }
+    }
+
+    private static String stripCq4Extension(String fileName) {
+        return fileName.substring(0, fileName.length() - ".cq4".length());
+    }
+
+    // ------------------------------------------------------------------
+    // export
     // ------------------------------------------------------------------
 
     @Override
     public ExportResult export(
             String targetDirectory, long fromIndex, Long toIndex, int entriesPerFile) {
         ensureUsable();
-        throw new UnsupportedOperationException("export is implemented in milestone M3");
+        Objects.requireNonNull(targetDirectory, "targetDirectory");
+        if (entriesPerFile <= 0) {
+            throw new IllegalArgumentException(
+                    "entriesPerFile must be positive, got: " + entriesPerFile);
+        }
+        // clamp to the earliest surviving message (FASTER reference clamps to BeginAddress)
+        long first = safeFirstIndex();
+        long actualFrom = fromIndex;
+        if (first >= 0 && fromIndex < first) {
+            LOG.warn(
+                    "LatchQueue '{}' export fromIndex {} is below the earliest surviving message {}; "
+                            + "data in [{}, {}) was cleaned up and cannot be exported",
+                    name,
+                    fromIndex,
+                    first,
+                    fromIndex,
+                    first);
+            actualFrom = first;
+        }
+        long toExclusive = toIndex == null ? Long.MAX_VALUE : toIndex;
+        List<String> filePaths = new ArrayList<>();
+        if (actualFrom >= toExclusive) {
+            return new ExportResult(filePaths, 0, actualFrom, actualFrom);
+        }
+        try {
+            Files.createDirectories(Path.of(targetDirectory));
+        } catch (IOException e) {
+            throw new LatchQException("cannot create export directory " + targetDirectory, e);
+        }
+        String filePrefix = TypeStorageNaming.sanitize(type.getName()) + "_" + actualFrom + "_part";
+        String fileSuffix =
+                "_"
+                        + DateTimeFormatter.ofPattern("yyyyMMddHHmmssSSS")
+                                .format(LocalDateTime.now())
+                        + "_"
+                        + Long.toHexString(System.nanoTime() & 0xFFFFF)
+                        + ".jsonl";
+
+        long count = 0;
+        long lastReadIndex = -1;
+        int fileIndex = 0;
+        int entriesInFile = 0;
+        java.io.OutputStream out = null;
+        try (ExcerptTailer tailer = queue.createTailer()) { // isolated from the consumer position
+            if (actualFrom >= 0) {
+                tailer.moveToIndex(actualFrom);
+            }
+            while (true) {
+                try (DocumentContext ctx = tailer.readingDocument()) {
+                    if (!ctx.isPresent()) {
+                        break;
+                    }
+                    long index = ctx.index();
+                    if (index >= toExclusive) {
+                        break;
+                    }
+                    byte[][] holder = new byte[1][];
+                    ctx.wire().readBytes(in -> holder[0] = in.toByteArray());
+                    if (holder[0].length == 0) {
+                        continue; // phantom document at a cleaned-up position, skip forward
+                    }
+                    if (out == null) {
+                        Path file = Path.of(targetDirectory, filePrefix + fileIndex++ + fileSuffix);
+                        out = Files.newOutputStream(file);
+                        filePaths.add(file.toString());
+                        entriesInFile = 0;
+                    }
+                    out.write(holder[0]);
+                    out.write('\n');
+                    count++;
+                    entriesInFile++;
+                    lastReadIndex = index;
+                    if (entriesInFile >= entriesPerFile) {
+                        out.close();
+                        out = null;
+                    }
+                }
+            }
+        } catch (IOException e) {
+            throw new LatchQException("export failed after " + count + " entries", e);
+        } finally {
+            if (out != null) {
+                try {
+                    out.close();
+                } catch (IOException e) {
+                    LOG.warn("LatchQueue '{}' failed to close the last export file", name, e);
+                }
+            }
+        }
+        LOG.info(
+                "LatchQueue '{}' exported {} entries from index {} into {} file(s)",
+                name,
+                count,
+                actualFrom,
+                filePaths.size());
+        // exclusive upper bound for the next incremental export; an empty export keeps
+        // toIndex == fromIndex (mirroring the FASTER reference result)
+        long resultTo = count == 0 ? actualFrom : lastReadIndex + 1;
+        return new ExportResult(filePaths, count, actualFrom, resultTo);
     }
 
     // ------------------------------------------------------------------

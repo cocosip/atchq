@@ -72,3 +72,9 @@
 3. **大消息读取**:弹性预分配缓冲在 32MB 级不可靠,改用 `readBytes(ReadBytesMarshallable)` 回调式精确拷贝(视图自带真实长度),任意大小消息均安全。
 4. **Jackson `StreamReadConstraints`**:Jackson 2.15+ 默认限制单字符串 20M 字符,大 payload 会在**读取侧**被 Jackson 拒绝。LatchQ 内部 ObjectMapper 将 `maxStringLength` 放开(上限统一由 `maxMessageSizeBytes` 在写入侧管控)。
 5. **日志约定**:core 只依赖 `slf4j-api` 2.x 门面,不携带任何绑定实现;测试作用域的 `slf4j-simple` 仅用于测试期日志可见,不会传递给使用方。上层(如 Spring Boot 应用)自行引入 log4j2 等实现。
+
+## 5. M3 实现期发现(补充)
+
+1. **`queue.firstIndex()` 在会话内缓存**:清理删除旧 cycle 文件后,同会话内 `firstIndex()` 仍返回删除前的值,重开队列后才刷新。LatchQ 文档注明该值为"会话内可能滞后"的近似值,启动恢复的钳制(重开时计算)不受影响。
+2. **文件名 ↔ cycle 的差值换算法**:Chronicle 的 cycle 文件命名与时区/纪元约定相关,无法可靠地从 cycle 正推文件名;但**任意固定时区解析两个文件名后取差值**,时区偏移在差值中抵消,`cycle(文件) = 锚点cycle + round((t(文件) − t(锚点)) / cycle长度)` 精确成立(M3 清理的目录扫描用此法,锚点取本会话 `onAcquired` 的最大 cycle 文件)。
+3. **清理只依据已持久化 checkpoint**:`persistedTruncate`(checkpoint 任务成功写盘后更新)决定可删除边界 `cpCycle = toCycle(persisted)`;`cycle < cpCycle` 的文件整文件删除(其内全部消息必然早于 checkpoint)。内存 truncate 先进、checkpoint 滞后的窗口内不删任何文件。删除失败(Windows 句柄延迟)容忍并下轮重试。
