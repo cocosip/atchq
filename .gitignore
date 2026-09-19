@@ -44,3 +44,4 @@ target/
 .project
 .settings/
 *.iml
+dependency-reduced-pom.xml
