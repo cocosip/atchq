@@ -18,6 +18,7 @@
         <module>latchq-spring-boot-starter</module>
         <module>samples/latchq-sample-console</module>
         <module>samples/latchq-sample-spring-boot</module>
+        <module>latchq-benchmarks</module>
     </modules>
 
     <properties>
