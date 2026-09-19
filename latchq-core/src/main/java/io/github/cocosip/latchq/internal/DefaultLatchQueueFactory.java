@@ -20,6 +20,7 @@ public final class DefaultLatchQueueFactory implements LatchQueueFactory {
 
     private final LatchQueueOptions options;
     private final ConcurrentHashMap<CacheKey, LatchQueue<?>> queues = new ConcurrentHashMap<>();
+    private volatile boolean closed;
 
     public DefaultLatchQueueFactory(LatchQueueOptions options) {
         Objects.requireNonNull(options, "options");
@@ -32,6 +33,10 @@ public final class DefaultLatchQueueFactory implements LatchQueueFactory {
     public <T> LatchQueue<T> getOrCreate(String name, Class<T> type) {
         Objects.requireNonNull(name, "name");
         Objects.requireNonNull(type, "type");
+        if (closed) {
+            throw new io.github.cocosip.latchq.exception.LatchQException(
+                    "the latchq factory is closed and cannot create new queues");
+        }
         options.validate();
         LatchQueue<?> queue =
                 queues.computeIfAbsent(
@@ -52,6 +57,7 @@ public final class DefaultLatchQueueFactory implements LatchQueueFactory {
 
     @Override
     public void close() {
+        closed = true;
         queues.values()
                 .forEach(
                         queue -> {

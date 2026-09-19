@@ -15,6 +15,9 @@
 
     <modules>
         <module>latchq-core</module>
+        <module>latchq-spring-boot-starter</module>
+        <module>samples/latchq-sample-console</module>
+        <module>samples/latchq-sample-spring-boot</module>
     </modules>
 
     <properties>

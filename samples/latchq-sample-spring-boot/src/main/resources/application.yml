@@ -1,0 +1,16 @@
+latchq:
+  root-path: target/sample-spring-data
+  configurations:
+    audit:
+      file-name: audit
+      sync-interval-millis: 1000
+      pre-read-capacity: 1000
+
+spring:
+  main:
+    web-application-type: servlet
+  application:
+    name: latchq-sample-spring-boot
+
+server:
+  port: 18080

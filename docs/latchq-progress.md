@@ -25,7 +25,7 @@
 | M1 | 核心读写(latchq-core 骨架、配置、写入、scan 扇出、read API) | M0 | **已完成(2026-09-19,38 用例)** |
 | M2 | 进度与 Gap(区间合并、gap 检测/跳过、checkpoint 持久化与恢复) | M1 | **已完成(2026-09-19,55 用例全绿)** |
 | M3 | 清理与导出(cycle 文件清理、export API、metrics 补全) | M2 | **已完成(2026-09-19,61 用例全绿)** |
-| M4 | Spring Boot Starter 与示例(自动配置、两个 sample) | M2 | 未开始 |
+| M4 | Spring Boot Starter 与示例(自动配置、两个 sample) | M2 | **已完成(2026-09-19,64 用例全绿,示例实测跑通)** |
 | M5 | 测试、基准与发布准备(并发/崩溃/roll 边界测试、JMH、文档) | M1~M4 | 未开始 |
 
 > 单人开发按 M0→M1→M2→M3→M4→M5 顺序推进;M3 与 M4 无相互依赖,如有多人可并行。
@@ -147,3 +147,4 @@
 - 2026-09-19:**M1 完成**。核心读写落地(`LatchQueue` API、配置模型、工厂自动初始化、ThreadLocal appender 写入、scan 虚拟线程 + 有界队列扇出、优雅停机)。实现期两项重要发现并修复:① Chronicle 资源单线程约束——tailer 必须在 scan 线程内创建/使用/关闭;② 单条消息上限 = blockSize/2 - 4(默认 ~16MB)→ 新增 `maxMessageSizeBytes` 配置(默认按业务预期定 20MB)前置校验,Jackson 字符串读取限制同步放开。38 用例全绿。
 - 2026-09-19:**M2 完成**。`commit()` 校验(无效/过期/跨界忽略)、区间合并(两阶段加锁)、gap 告警与强制跳过(超时与区间数超限两条件独立)、`forceCommitGap()`、`CheckpointStore` 原子写(temp+fsync+atomic move)、启动恢复(checkpoint 钳制 firstIndex + 修正随 checkpoint 持久化 + 种子修正)。修复一处对照 FASTER 源码发现的合并 bug:强制跳过应推进到 `range.end()` 而非 `range.start()`。55 用例全绿。下一步:M3 清理与导出。
 - 2026-09-19:**M3 完成**。cycle 文件清理落地:只删"整 cycle 早于**已持久化 checkpoint**"的文件(persistedTruncate 由 checkpoint 任务成功写盘后更新),未打开过的旧文件用文件名差值法换算 cycle(时区偏移在差值中抵消,规避 M0 命名陷阱);删除失败容忍重试。`export()` 落地:独立 tailer、fromIndex 钳制、`[from, to)` 语义、按 entriesPerFile 分文件、文件名防碰撞、空结果 toIndex==fromIndex。新发现:`queue.firstIndex()` 会话内缓存,清理后滞后直至重开(已记录文档)。61 用例全绿。下一步:M4 Spring Boot Starter。
+- 2026-09-19:**M4 完成**。`latchq-spring-boot-starter` 落地:`@ConfigurationProperties(prefix="latchq")` 绑定、AutoConfiguration.imports 注册、factory Bean(destroyMethod=close)随应用关闭做最终 checkpoint、`latchq.enabled` 开关;工厂补"关闭后 getOrCreate 抛异常"语义(测试暴露的真实缺陷)。两个示例落地并实测:console(100 写/100 读/100 提交收敛)与 spring-boot(YAML 配置 + Controller 包 export);示例运行需 MAVEN_OPTS 携带 JVM opens(已在 samples/README.md 记录)。修复:后台循环在 shutdown interrupt 落在文件 I/O 中间时静默退出,不再刷 ERROR。64 用例全绿。下一步:M5 测试、基准与文档。

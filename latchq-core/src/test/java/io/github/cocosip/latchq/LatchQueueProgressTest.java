@@ -184,7 +184,9 @@ class LatchQueueProgressTest {
                             () ->
                                     assertThat(queue.metrics().truncateBeforeIndex())
                                             .isEqualTo(expectedTruncate));
-            assertThat(queue.metrics().largestGapSize()).isEqualTo(2);
+            // at least the two uncommitted messages; the gap can measure larger in index space
+            // when the writes straddle a roll boundary (indexes are cycle-scoped, not dense)
+            assertThat(queue.metrics().largestGapSize()).isGreaterThanOrEqualTo(2);
             assertThat(queue.metrics().currentGapCount()).isZero();
         }
     }

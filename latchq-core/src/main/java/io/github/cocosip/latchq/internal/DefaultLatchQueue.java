@@ -694,6 +694,9 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             try {
                 mergeAndAdvance();
             } catch (Exception e) {
+                if (closed) {
+                    return; // shutdown interrupt landed mid-work, the final checkpoint covers it
+                }
                 LOG.error("LatchQueue '{}' range merging failed", name, e);
             }
             try {
@@ -851,6 +854,9 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                 checkpointStore.write(truncate, java.util.Map.copyOf(emptyGapCorrections));
                 persistedTruncate.set(truncate);
             } catch (Exception e) {
+                if (closed) {
+                    return; // shutdown interrupt landed mid-write, the final checkpoint covers it
+                }
                 LOG.error("LatchQueue '{}' checkpoint write failed", name, e);
             }
             try {
@@ -872,6 +878,9 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             try {
                 cleanupCycleFiles();
             } catch (Exception e) {
+                if (closed) {
+                    return; // shutdown interrupt, no cleanup work matters any more
+                }
                 LOG.error("LatchQueue '{}' cycle cleanup failed", name, e);
             }
             try {
