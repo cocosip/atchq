@@ -4,7 +4,7 @@
 
 ## 当前阶段
 
-**M1 核心读写实现中** — M0 技术验证已完成(10/10 核实用例通过,结论见 [spike-notes.md](./spike-notes.md)),设计文档已回填冻结(v0.3)。
+**M3 清理与导出实现中** — M0 技术验证、M1 核心读写、M2 进度与 Gap 均已完成并提交,55 用例全绿。
 
 ## 版本与基线(定稿)
 
@@ -22,8 +22,8 @@
 | 里程碑 | 内容 | 前置依赖 | 状态 |
 |---|---|---|---|
 | M0 | 技术验证(spike)与设计冻结 | 设计评审通过 | **已完成(2026-09-18,10/10 用例通过)** |
-| M1 | 核心读写(latchq-core 骨架、配置、写入、scan 扇出、read API) | M0 | 未开始 |
-| M2 | 进度与 Gap(区间合并、gap 检测/跳过、checkpoint 持久化与恢复) | M1 | 未开始 |
+| M1 | 核心读写(latchq-core 骨架、配置、写入、scan 扇出、read API) | M0 | **已完成(2026-09-19,38 用例)** |
+| M2 | 进度与 Gap(区间合并、gap 检测/跳过、checkpoint 持久化与恢复) | M1 | **已完成(2026-09-19,55 用例全绿)** |
 | M3 | 清理与导出(cycle 文件清理、export API、metrics 补全) | M2 | 未开始 |
 | M4 | Spring Boot Starter 与示例(自动配置、两个 sample) | M2 | 未开始 |
 | M5 | 测试、基准与发布准备(并发/崩溃/roll 边界测试、JMH、文档) | M1~M4 | 未开始 |
@@ -144,3 +144,5 @@
 
 - 2026-09-18:设计文档 v0.1 完成;对照 `SharpAbp.Abp.Faster` 源码完成评审,设计文档修订至 v0.2;本文档重写为任务分解式开发计划;版本基线定稿(`chronicle-queue 5.27ea5`,JDK 21)。
 - 2026-09-18:**M0 完成**。T0.1~T0.6 全部执行完毕,10/10 验证用例通过(`ChronicleApiVerificationTest`),结论归档 [spike-notes.md](./spike-notes.md) 并回填设计文档第 10 节(v0.3,设计冻结)。关键定案:nextIndex 采用前瞻推导(7.1 路线 2);scan 线程用无名 tailer;JDK 21 需 4 个 `--add-opens` + 1 个 `--add-exports`;旧 cycle 文件可在队列打开时安全删除(`onReleased` 先行)。工程骨架(parent + latchq-core + Maven Wrapper 3.9.16)随本里程碑建立。下一步:M1 核心读写。
+- 2026-09-19:**M1 完成**。核心读写落地(`LatchQueue` API、配置模型、工厂自动初始化、ThreadLocal appender 写入、scan 虚拟线程 + 有界队列扇出、优雅停机)。实现期两项重要发现并修复:① Chronicle 资源单线程约束——tailer 必须在 scan 线程内创建/使用/关闭;② 单条消息上限 = blockSize/2 - 4(默认 ~16MB)→ 新增 `maxMessageSizeBytes` 配置(默认按业务预期定 20MB)前置校验,Jackson 字符串读取限制同步放开。38 用例全绿。
+- 2026-09-19:**M2 完成**。`commit()` 校验(无效/过期/跨界忽略)、区间合并(两阶段加锁)、gap 告警与强制跳过(超时与区间数超限两条件独立)、`forceCommitGap()`、`CheckpointStore` 原子写(temp+fsync+atomic move)、启动恢复(checkpoint 钳制 firstIndex + 修正随 checkpoint 持久化 + 种子修正)。修复一处对照 FASTER 源码发现的合并 bug:强制跳过应推进到 `range.end()` 而非 `range.start()`。55 用例全绿。下一步:M3 清理与导出。

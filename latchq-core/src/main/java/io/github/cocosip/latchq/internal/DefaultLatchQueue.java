@@ -73,6 +73,8 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
 
     private ChronicleQueue queue;
     private Thread scanThread;
+    private Thread completeThread;
+    private Thread checkpointThread;
     private volatile boolean running;
 
     private final ArrayBlockingQueue<BufferedLogEntry> pending;
@@ -82,7 +84,7 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
     /**
      * Provisional nextIndex handed out with the tail entry while the queue was caught up, or -1.
      * When the real next message arrives at a different index (a roll happened while idle), an
-     * empty-gap correction is recorded so the M2 merge skips the empty range immediately instead of
+     * empty-gap correction is recorded so the merge skips the empty range immediately instead of
      * waiting for the force-skip timeout.
      */
     private final AtomicLong provisionalNextIndex = new AtomicLong(-1);
@@ -97,7 +99,28 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
     /** Index of the first message not yet known to be processed; -1 while unknown. */
     private final AtomicLong truncateBeforeIndex = new AtomicLong(-1);
 
-    // Metrics; the gap-related counters are populated by the complete task added in M2.
+    /** Committed ranges waiting to be merged; guarded by {@link #rangesLock}. */
+    private final java.util.TreeSet<CompletedRange> completedRanges =
+            new java.util.TreeSet<>(CompletedRange.naturalOrder());
+
+    /** Guards {@link #completedRanges} and the gap-tracking state. */
+    private final java.util.concurrent.locks.ReentrantLock rangesLock =
+            new java.util.concurrent.locks.ReentrantLock();
+
+    // Gap tracking; all fields guarded by rangesLock.
+    private long lastGapStart = -1;
+    private long lastGapEnd = -1;
+    private long lastGapDetectedMillis = 0;
+    private long lastGapWarnedMillis = 0;
+
+    /** Seeded restore index of the current scan session; drives the seed correction. */
+    private long seedIndex = -1;
+
+    private boolean seedPending;
+
+    private CheckpointStore checkpointStore;
+
+    // Metrics.
     private final LongAdder totalWriteCount = new LongAdder();
     private final LongAdder totalReadCount = new LongAdder();
     private final LongAdder totalCommittedRanges = new LongAdder();
@@ -171,16 +194,48 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             }
             this.queue = builder.build();
 
-            // Restore the consumer position: M1 starts from the earliest existing message;
-            // M2 replaces this with the persisted checkpoint (clamped by firstIndex).
-            long restore = safeFirstIndex();
+            // Restore the consumer position from the persisted checkpoint (clamped by
+            // firstIndex so a stale checkpoint cannot point into cleaned-up territory).
+            this.checkpointStore = new CheckpointStore(queueDirectory);
+            CheckpointStore.Checkpoint checkpoint = checkpointStore.read();
+            long restore;
+            if (checkpoint != null) {
+                restore = checkpoint.truncate();
+                emptyGapCorrections.putAll(checkpoint.corrections());
+                long first = safeFirstIndex();
+                if (first >= 0 && restore < first) {
+                    LOG.warn(
+                            "LatchQueue '{}' checkpoint index {} is below the earliest existing message {}; resuming from {}",
+                            name,
+                            restore,
+                            first,
+                            first);
+                    restore = first;
+                }
+            } else {
+                restore = safeFirstIndex();
+            }
             truncateBeforeIndex.set(restore);
+            // seed correction: the first real read after a restart that lands past the seed
+            // index proves the range [seed, index) holds no messages, bridging a provisional
+            // checkpoint across an idle roll
+            this.seedIndex = restore;
+            this.seedPending = restore >= 0;
 
+            final long restoreIndex = restore;
             this.running = true;
             // The tailer is created, used and closed entirely on the scan thread: Chronicle
             // resources are single-threaded (ThreadingIllegalStateException otherwise).
             this.scanThread =
-                    Thread.ofVirtual().name("latchq-scan-" + name).start(() -> scanLoop(restore));
+                    Thread.ofVirtual()
+                            .name("latchq-scan-" + name)
+                            .start(() -> scanLoop(restoreIndex));
+            this.completeThread =
+                    Thread.ofVirtual().name("latchq-complete-" + name).start(this::completeLoop);
+            this.checkpointThread =
+                    Thread.ofVirtual()
+                            .name("latchq-checkpoint-" + name)
+                            .start(this::checkpointLoop);
             this.initialized = true;
             LOG.info(
                     "LatchQueue '{}' for type {} initialized, directory={}, restoreIndex={}, rollCycle={}",
@@ -206,17 +261,29 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             closed = true;
         }
         running = false;
-        if (scanThread != null) {
-            scanThread.interrupt();
+        for (Thread thread : new Thread[] {scanThread, completeThread, checkpointThread}) {
+            if (thread != null) {
+                thread.interrupt();
+                try {
+                    thread.join(TimeUnit.SECONDS.toMillis(5));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+        // final checkpoint after the scan stopped: everything scanned is now reflected in the
+        // truncate index, and the queue is still open for the write
+        if (checkpointStore != null) {
             try {
-                scanThread.join(TimeUnit.SECONDS.toMillis(5));
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
+                checkpointStore.write(
+                        truncateBeforeIndex.get(), java.util.Map.copyOf(emptyGapCorrections));
+            } catch (IOException e) {
+                LOG.error("LatchQueue '{}' failed to write the final checkpoint", name, e);
             }
         }
         if (queue != null) {
             // The scan thread already closed its tailer; this also closes appenders registered
-            // with the queue and performs the final checkpoint flush once the task exists (M2).
+            // with the queue.
             queue.close();
         }
         LOG.info("LatchQueue '{}' for type {} closed", name, type.getName());
@@ -335,6 +402,7 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             }
             long index = ctx.index();
             reconcileProvisionalTail(index);
+            recordSeedCorrection(index);
             truncateBeforeIndex.compareAndSet(-1, index);
             // offer() holds the entry back until the next real read stamps its nextIndex
             BufferedLogEntry stamped = stamper.offer(new BufferedLogEntry(holder[0], index, -1));
@@ -376,6 +444,27 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                     name,
                     provisional,
                     realIndex);
+        }
+    }
+
+    /**
+     * Called on the first real read of a scan session. When the seeded restore index points at a
+     * provisional (non-existent) position after an idle roll, the first real message proves the
+     * range between the seed and itself is empty; recording that as a correction lets the merge
+     * advance immediately instead of waiting for the force-skip timeout.
+     */
+    private void recordSeedCorrection(long firstReadIndex) {
+        if (!seedPending) {
+            return;
+        }
+        seedPending = false;
+        if (seedIndex >= 0 && firstReadIndex != seedIndex) {
+            emptyGapCorrections.put(seedIndex, firstReadIndex);
+            LOG.info(
+                    "LatchQueue '{}' recorded seed correction [{}, {}) on restore",
+                    name,
+                    seedIndex,
+                    firstReadIndex);
         }
     }
 
@@ -456,20 +545,284 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
     }
 
     // ------------------------------------------------------------------
-    // progress (implemented in milestone M2)
+    // commit and progress merging
     // ------------------------------------------------------------------
 
     @Override
     public void commit(Collection<Position> positions) {
         Objects.requireNonNull(positions, "positions");
         ensureUsable();
-        throw new UnsupportedOperationException("commit is implemented in milestone M2");
+        int invalid = 0;
+        int stale = 0;
+        int overlap = 0;
+        int duplicate = 0;
+        int added = 0;
+        rangesLock.lock();
+        try {
+            long truncate = truncateBeforeIndex.get();
+            for (Position position : positions) {
+                // validation rules mirror the FASTER reference implementation
+                if (position == null || !position.isValid()) {
+                    invalid++;
+                    continue;
+                }
+                if (position.nextIndex() <= truncate) {
+                    stale++; // already merged or abandoned by a force-skip
+                    continue;
+                }
+                if (position.index() < truncate) {
+                    overlap++; // crosses the truncate boundary, cannot be applied safely
+                    continue;
+                }
+                if (completedRanges.add(
+                        new CompletedRange(position.index(), position.nextIndex()))) {
+                    totalCommittedRanges.increment();
+                    added++;
+                } else {
+                    duplicate++;
+                }
+            }
+            if (invalid > 0) {
+                LOG.warn(
+                        "LatchQueue '{}' skipped {} invalid positions during commit",
+                        name,
+                        invalid);
+            }
+            if (stale > 0) {
+                LOG.warn(
+                        "LatchQueue '{}' ignored {} stale positions during commit (truncate={})",
+                        name,
+                        stale,
+                        truncate);
+            }
+            if (overlap > 0) {
+                LOG.warn(
+                        "LatchQueue '{}' ignored {} boundary-crossing positions during commit (truncate={})",
+                        name,
+                        overlap,
+                        truncate);
+            }
+            if (LOG.isDebugEnabled()) {
+                LOG.debug(
+                        "LatchQueue '{}' committed {} positions ({} duplicates, {} invalid, {} stale, {} overlapping)",
+                        name,
+                        added,
+                        duplicate,
+                        invalid,
+                        stale,
+                        overlap);
+            }
+        } finally {
+            rangesLock.unlock();
+        }
     }
 
     @Override
     public void forceCommitGap(long gapStart, long gapEnd) {
         ensureUsable();
-        throw new UnsupportedOperationException("forceCommitGap is implemented in milestone M2");
+        if (gapStart < 0) {
+            throw new IllegalArgumentException("gapStart must be non-negative, got: " + gapStart);
+        }
+        if (gapEnd <= gapStart) {
+            throw new IllegalArgumentException(
+                    "gapEnd must be greater than gapStart, start: "
+                            + gapStart
+                            + ", end: "
+                            + gapEnd);
+        }
+        rangesLock.lock();
+        try {
+            if (completedRanges.add(new CompletedRange(gapStart, gapEnd))) {
+                LOG.error(
+                        "LatchQueue '{}' manually filled gap [{}, {}) ({} messages); DATA IN THIS RANGE IS ABANDONED",
+                        name,
+                        gapStart,
+                        gapEnd,
+                        gapEnd - gapStart);
+                resetGapTracking();
+            } else {
+                LOG.warn(
+                        "LatchQueue '{}' gap [{}, {}) was already recorded",
+                        name,
+                        gapStart,
+                        gapEnd);
+            }
+        } finally {
+            rangesLock.unlock();
+        }
+    }
+
+    /** Background complete task: periodically merges committed ranges into the truncate index. */
+    private void completeLoop() {
+        while (running && !closed) {
+            try {
+                mergeAndAdvance();
+            } catch (Exception e) {
+                LOG.error("LatchQueue '{}' range merging failed", name, e);
+            }
+            try {
+                Thread.sleep(configuration.getCompleteIntervalMillis());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+    }
+
+    /**
+     * Two-phase merge (mirrors the FASTER reference implementation): compute the continuous range
+     * and the removals under the lock, then advance the truncate index and remove the merged ranges
+     * - the lock is never held across the state transition.
+     */
+    private void mergeAndAdvance() {
+        long currentEnd = truncateBeforeIndex.get();
+        if (currentEnd < 0) {
+            return; // nothing scanned yet
+        }
+        long newEnd = currentEnd;
+        boolean gapDetected = false;
+        List<CompletedRange> merged = new ArrayList<>();
+        rangesLock.lock();
+        try {
+            // sorted snapshot; an index loop lets a bridged gap re-process the same range
+            List<CompletedRange> snapshot = new ArrayList<>(completedRanges);
+            for (int i = 0; i < snapshot.size(); i++) {
+                CompletedRange range = snapshot.get(i);
+                if (range.start() <= newEnd) {
+                    // connects to (or overlaps) the continuous range
+                    newEnd = Math.max(newEnd, range.end());
+                    merged.add(range);
+                    continue;
+                }
+                // gap detected at [newEnd, range.start)
+                gapDetected = true;
+                Long bridged = emptyGapCorrections.get(newEnd);
+                if (bridged != null && bridged == range.start()) {
+                    // the correction proves the gap is empty (idle roll): skip it at once
+                    emptyGapCorrections.remove(newEnd);
+                    newEnd = range.start();
+                    gapDetected = false;
+                    i--; // re-process the same range, which now connects
+                    continue;
+                }
+                long now = System.currentTimeMillis();
+                long gapSize = range.start() - newEnd;
+                largestGapSize.accumulateAndGet(gapSize, Math::max);
+                if (lastGapStart != newEnd || lastGapEnd != range.start()) {
+                    lastGapStart = newEnd;
+                    lastGapEnd = range.start();
+                    lastGapDetectedMillis = now;
+                    lastGapWarnedMillis = 0;
+                }
+                long gapAge = now - lastGapDetectedMillis;
+                long gapTimeout = configuration.getGapTimeoutMillis();
+                if (gapTimeout > 0
+                        && gapAge >= gapTimeout
+                        && (lastGapWarnedMillis == 0 || now - lastGapWarnedMillis >= gapTimeout)) {
+                    LOG.warn(
+                            "LatchQueue '{}' gap [{}, {}) ({} messages) has persisted for {} ms; a consumer may be stuck",
+                            name,
+                            newEnd,
+                            range.start(),
+                            gapSize,
+                            gapAge);
+                    lastGapWarnedMillis = now;
+                }
+                long forceTimeout = configuration.getForceCompleteGapTimeoutMillis();
+                boolean timeoutReached = forceTimeout > 0 && gapAge >= forceTimeout;
+                boolean rangesOverflow =
+                        configuration.getMaxCompletedRanges() > 0
+                                && completedRanges.size() > configuration.getMaxCompletedRanges();
+                if (timeoutReached || rangesOverflow) {
+                    LOG.error(
+                            "LatchQueue '{}' FORCING COMPLETION past gap [{}, {}) ({} messages, age {} ms, {} ranges); "
+                                    + "DATA IN THE GAP IS ABANDONED",
+                            name,
+                            newEnd,
+                            range.start(),
+                            gapSize,
+                            gapAge,
+                            completedRanges.size());
+                    newEnd = Math.max(newEnd, range.end());
+                    merged.add(range);
+                    resetGapTracking();
+                    gapDetected = false;
+                    continue; // keep merging behind the skipped gap
+                }
+                break; // ordinary gap: stop merging until it is filled
+            }
+        } finally {
+            rangesLock.unlock();
+        }
+
+        long before = truncateBeforeIndex.get();
+        if (newEnd > before) {
+            final long advancedTo = newEnd;
+            truncateBeforeIndex.updateAndGet(current -> Math.max(current, advancedTo));
+            rangesLock.lock();
+            try {
+                completedRanges.removeAll(merged);
+                currentGapCount.set(countGaps(advancedTo));
+            } finally {
+                rangesLock.unlock();
+            }
+            LOG.info(
+                    "LatchQueue '{}' advanced truncate index to {} ({} ranges merged)",
+                    name,
+                    newEnd,
+                    merged.size());
+        } else if (!gapDetected) {
+            rangesLock.lock();
+            try {
+                resetGapTracking();
+            } finally {
+                rangesLock.unlock();
+            }
+        }
+        // corrections below the truncate point are consumed forever
+        emptyGapCorrections.keySet().removeIf(key -> key < truncateBeforeIndex.get());
+    }
+
+    /** Counts discontinuities between the truncate point and the committed ranges. */
+    private long countGaps(long truncate) {
+        long gaps = 0;
+        long currentEnd = truncate;
+        for (CompletedRange range : completedRanges) {
+            if (range.start() > currentEnd) {
+                gaps++;
+            }
+            currentEnd = Math.max(currentEnd, range.end());
+        }
+        return gaps;
+    }
+
+    private void resetGapTracking() {
+        lastGapStart = -1;
+        lastGapEnd = -1;
+        lastGapDetectedMillis = 0;
+        lastGapWarnedMillis = 0;
+    }
+
+    // ------------------------------------------------------------------
+    // checkpoint persistence
+    // ------------------------------------------------------------------
+
+    /** Background checkpoint task: periodically persists the truncate index atomically. */
+    private void checkpointLoop() {
+        while (running && !closed) {
+            try {
+                checkpointStore.write(
+                        truncateBeforeIndex.get(), java.util.Map.copyOf(emptyGapCorrections));
+            } catch (Exception e) {
+                LOG.error("LatchQueue '{}' checkpoint write failed", name, e);
+            }
+            try {
+                Thread.sleep(configuration.getCheckpointIntervalMillis());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -511,13 +864,20 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
     public LatchQueueMetrics metrics() {
         long first = queue == null || closed ? -1 : safeFirstIndex();
         long last = queue == null || closed ? -1 : lastIndexAppended();
+        rangesLock.lock();
+        int rangeCount;
+        try {
+            rangeCount = completedRanges.size();
+        } finally {
+            rangesLock.unlock();
+        }
         return new LatchQueueMetrics(
                 totalWriteCount.sum(),
                 totalReadCount.sum(),
                 totalCommittedRanges.sum(),
                 currentGapCount.get(),
                 largestGapSize.get(),
-                0, // completed-range count arrives with the complete task in M2
+                rangeCount,
                 truncateBeforeIndex.get(),
                 first,
                 last);
