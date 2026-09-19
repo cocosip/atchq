@@ -186,6 +186,16 @@
                         <importOrder/>
                     </java>
                 </configuration>
+                <executions>
+                    <!-- formatting is a verify gate, enforced in CI -->
+                    <execution>
+                        <id>spotless-check</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>check</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
             <plugin>
                 <groupId>org.jacoco</groupId>
