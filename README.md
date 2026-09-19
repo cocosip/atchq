@@ -20,6 +20,8 @@ Documentation (Simplified Chinese): [docs/](./docs/) - design, verification note
 - **Index-range export** to JSONL files for business-owned download/inspection APIs.
 - Multiple queues of different payload types coexisting in one JVM
   (`factory.getOrCreate(name, Type)`), or a single queue via `LatchQueueBuilder`.
+- **Static holder** (`LatchQueueHolder`) sharing one factory process-wide for plain-Java apps
+  without a DI container.
 
 ## Quick start (plain Java)
 
@@ -44,6 +46,31 @@ queue.close(); // graceful shutdown, final checkpoint
 
 `read(count)` blocks until at least one entry is available; `read(count, timeout)` returns an
 empty list when nothing arrives in time. Both drain up to `count` entries without extra waiting.
+
+### Static holder (plain Java, usage across multiple classes)
+
+When usage is spread over several classes and no DI container shares the factory, initialize the
+static holder once at startup and reach the same factory from any class - creating a factory (or
+builder queue) per class would put multiple queue instances on the same files:
+
+```java
+// startup, once
+LatchQueueHolder.init(options -> options
+        .setRootPath("/data/latchq")
+        .configure("orders", c -> c.setFileName("orders")));
+
+// anywhere, in any class
+LatchQueue<Order> queue = LatchQueueHolder.getOrCreate("orders", Order.class);
+
+// shutdown, once: closes every queue and performs the final checkpoint
+LatchQueueHolder.reset();
+```
+
+`init` fails fast when called twice, `getOrCreate` before `init` throws
+`LatchQNotInitializedException`, and `reset` is idempotent and allows re-initializing. The holder
+does not register a JVM shutdown hook - the application owns the lifecycle. Spring Boot
+applications should rely on the injected `LatchQueueFactory` bean instead; the holder keeps its
+own independent factory instance.
 
 ### Spring Boot
 

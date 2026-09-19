@@ -1,6 +1,6 @@
 # LatchQ 开发计划与进度跟踪
 
-更新日期:2026-09-18
+更新日期:2026-09-19
 
 ## 当前阶段
 
@@ -151,3 +151,4 @@
 - 2026-09-19:**M5 完成**。专项测试:并发长跑(3 写 4 读 + 故意停顿制造真实 gap 后恢复,不重不漏)、roll 边界专项(40 条跨多个 1 秒 cycle 位置单调不回退)、LatchQ 层崩溃矩阵(子进程经 LatchQueue API 写 30 条并 commit、checkpoint 落盘后 kill -9,重开不重复投递且可继续写);`latchq-benchmarks` JMH 模块(write/batchWrite/read,手动运行);根 README(快速上手 + JDK 21 参数 + 配置表)。67 用例全绿。
 - 2026-09-19:**最终代码走查完成**。逐类审查核心并发代码后修复 2 处:① 工厂 `getOrCreate` 与 `close()` 的创建竞态——并发时新建队列漏关,改为创建后复查、已关闭则补关并抛异常;② 清理目录扫描的文件名差值法在夏令时切换时 cycle 换算可能偏差 ±1,极端情况会误删 checkpoint 所在 cycle,增加一个 cycle 的安全余量(精确映射分支不受影响)。审查确认的关键正确性点:合并的两阶段加锁无跨 I/O 持锁;commit/merge 的 stale 判定竞态无害(多出的 range 下轮合并消化);清理的 cycle 单调性依据成立(高 cycle ⇒ 高 index);checkpoint 原子写(temp+fsync+move)与最终 checkpoint 时序正确;export 的幻影文档防御与空结果语义正确。已知可接受限制:ThreadLocal appender 在短命写线程反复创建时资源累积至队列关闭才释放(长命线程池场景无影响)。修复后全量 verify 通过。
 - 2026-09-19:**二轮完善(基准/README/CI/全量走查)**。① 基准测试落地并产出真实结果(write ≈ 1.21M msgs/s、batchWrite ≈ 1.03M msgs/s、read+commit 管线 ≈ 25.5k msgs/s,单消费者乒乓形态的下限值),修复 JMH fork 的类路径问题(改用 shade uber-jar 运行,fork JVM 自动携带 --add-opens);② README.md 全英文重写,含快速上手、完整配置表、gap/幂等说明与基准结果;③ CI/CD:GitHub Actions(`.github/workflows/ci.yml`)push/PR 触发 `mvnw verify`(测试 + jacoco + spotless:check 门禁,spotless 已绑入 verify),workflow_dispatch 可手动触发 JMH 基准(uber-jar);④ 全量走查二遍:遗留占位检查(无 TODO/Unsupported 残留)、starter 配置拷贝完整性(11 字段全覆盖)、构建警告修复(示例 jar 插件版本号)。全量 verify 通过(64 core + 3 starter)。
+- 2026-09-19:**补充跨类共享入口 `LatchQueueHolder`(评审反馈)**。现状确认:starter 已支持依赖注入(`LatchQueueAutoConfiguration` 注册 `LatchQueueFactory` Bean,业务类构造器注入,spring-boot 示例即此用法);缺口在仅依赖 `latchq-core` 的非 DI 场景——多个业务类各自 `LatchQueueBuilder.build()` 会在同一队列文件上产生多个独立实例,checkpoint 与清理互相干扰。新增 `LatchQueueHolder`:`init(options|configurer)` 一次性初始化进程级共享工厂(重复初始化 fail-fast)、`getOrCreate(name, type)`/`getInstance()` 供任意类静态访问、`reset()` 关闭共享工厂并允许重新初始化(幂等);不注册 JVM shutdown hook,生命周期由应用负责;与 Spring 容器管理的 Bean 相互独立。新增 5 个单测(init 前访问/重复 init/缓存共享/并发首建/reset 后重开),全量 verify 通过(69 core + 3 starter)。
