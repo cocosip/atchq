@@ -63,6 +63,11 @@ public final class DefaultLatchQueueFactory implements LatchQueueFactory {
     }
 
     @Override
+    public boolean isActive() {
+        return !closed;
+    }
+
+    @Override
     public void close() {
         closed = true;
         queues.values()

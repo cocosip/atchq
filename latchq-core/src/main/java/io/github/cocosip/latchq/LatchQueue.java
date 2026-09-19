@@ -28,12 +28,20 @@ public interface LatchQueue<T> extends AutoCloseable {
     /** Writes a single payload and returns its index. */
     long write(T entity);
 
-    /** Writes a batch of payloads and returns their indexes in order. */
+    /**
+     * Writes a batch of payloads and returns their indexes in order. Not atomic: if a write fails
+     * mid-batch, the earlier payloads are already durable but their indexes are not returned;
+     * callers that must account for every message should write individually or reconcile via {@link
+     * #lastIndexAppended()}.
+     */
     List<Long> batchWrite(List<T> values);
 
     /**
      * Reads up to {@code count} entries, blocking until at least one entry is available. Additional
-     * entries are drained without waiting.
+     * entries are drained without waiting. Throws a {@code LatchQException} instead of hanging when
+     * the queue is closed while waiting. An entry that cannot be deserialized throws a {@code
+     * LatchQDeserializationException} carrying its index range; skip it via {@link
+     * #forceCommitGap(long, long)} to keep consuming.
      */
     LogEntryList<T> read(int count);
 
@@ -78,7 +86,8 @@ public interface LatchQueue<T> extends AutoCloseable {
 
     /**
      * Closes the queue gracefully: stops the background scan, performs a final checkpoint and
-     * releases storage. Idempotent; all other methods throw after close.
+     * releases storage. Idempotent; all other methods throw after close. Consumers blocked in a
+     * read are woken with a {@code LatchQException} instead of hanging.
      */
     @Override
     void close();

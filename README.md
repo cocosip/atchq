@@ -145,6 +145,38 @@ logs an ERROR - **the messages inside the gap are abandoned**. Business processi
 therefore be idempotent. Empty gaps (idle roll boundaries) are bridged automatically via
 recorded corrections and never need a force-skip.
 
+## Poison messages and payload evolution
+
+An entry that no longer deserializes into the configured payload type (typically a schema that
+drifted from stored JSON) makes `read` throw a `LatchQDeserializationException` carrying the
+entry's index range. The failed entry is gone for the running session; skip it explicitly to
+keep consuming durably:
+
+```java
+try {
+    batch = queue.read(100);
+} catch (LatchQDeserializationException e) {
+    LOG.error("poison message at {}", e.getIndex(), e);
+    queue.forceCommitGap(e.getIndex(), e.getNextIndex()); // abandon it, logged as ERROR
+}
+```
+
+Without that call the entry is re-delivered after a restart (it was never committed), so a
+crash loop is possible until the payload class is fixed or the message is skipped. Known
+unknown JSON properties are ignored on read, so adding fields to a payload stays compatible in
+both directions; only type drift on existing fields poisons. Messages written by `batchWrite`
+are not atomic as a batch - if a write fails mid-batch, the earlier payloads are already
+durable but their indexes are lost.
+
+## Shutdown behaviour
+
+`close()` (the starter calls it via the factory bean's destroy method) stops the background
+tasks, wakes consumers blocked in a read with a `LatchQException`, writes the final checkpoint
+and releases storage. Prefer the timed `read(count, timeout)` variant in consumer loops so
+shutdown stays responsive; consumers using the blocking `read(count)` are woken, but any
+thread still busy processing must stop on its own (e.g. a `@PreDestroy` flag like in the
+Spring sample).
+
 ## Benchmarks
 
 Measured on Windows 10 x64, JDK Temurin 21.0.12.1, Chronicle Queue 5.27ea5, ~120-byte JSON
@@ -172,6 +204,6 @@ JMH benchmarks on demand (`workflow_dispatch`).
 | Module | Purpose |
 |---|---|
 | `latchq-core` | the queue implementation (no framework bindings, SLF4J 2.x facade only) |
-| `latchq-spring-boot-starter` | `@ConfigurationProperties` binding + factory bean + graceful shutdown |
+| `latchq-spring-boot-starter` | `@ConfigurationProperties` binding + factory bean + graceful shutdown + optional health indicator |
 | `samples/*` | runnable console and Spring Boot examples |
 | `latchq-benchmarks` | JMH benchmarks (shaded executable jar, run manually) |

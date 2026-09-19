@@ -2,6 +2,7 @@ package io.github.cocosip.latchq.internal;
 
 import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.StreamReadConstraints;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.cocosip.latchq.ExportResult;
 import io.github.cocosip.latchq.LatchQueue;
@@ -11,8 +12,10 @@ import io.github.cocosip.latchq.LogEntryList;
 import io.github.cocosip.latchq.Position;
 import io.github.cocosip.latchq.config.LatchQueueConfiguration;
 import io.github.cocosip.latchq.config.LatchQueueOptions;
+import io.github.cocosip.latchq.exception.LatchQDeserializationException;
 import io.github.cocosip.latchq.exception.LatchQException;
 import io.github.cocosip.latchq.exception.LatchQNotInitializedException;
+import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -24,7 +27,9 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
@@ -80,7 +85,23 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
     private Thread completeThread;
     private Thread checkpointThread;
     private Thread cleanupThread;
+    private Thread syncThread;
     private volatile boolean running;
+
+    /**
+     * Close marker posted into {@link #pending} on {@link #close()}: wakes consumers blocked in a
+     * blocking read so they fail with a clear error instead of hanging until interrupted. A reader
+     * that takes the marker re-posts it, so one marker wakes every waiting consumer.
+     */
+    private static final BufferedLogEntry CLOSE_MARKER = new BufferedLogEntry(new byte[0], -1, -1);
+
+    /** Appenders created by this session, synced periodically per {@code syncIntervalMillis}. */
+    private final Set<ExcerptAppender> appenders = ConcurrentHashMap.newKeySet();
+
+    /** Bumped whenever the empty-gap corrections change, so idle checkpoints can be skipped. */
+    private final AtomicLong correctionsVersion = new AtomicLong();
+
+    private final AtomicLong persistedCorrectionsVersion = new AtomicLong();
 
     /**
      * Files opened by this session, keyed by cycle (populated through the store file listener).
@@ -162,7 +183,10 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
     /**
      * Object mapper whose stream read constraints are unlimited: the per-message size is already
      * enforced by {@code maxMessageSizeBytes} on write, so Jackson's default 20M-char string limit
-     * must not reject large (but admitted) payloads on read.
+     * must not reject large (but admitted) payloads on read. Unknown JSON properties are ignored so
+     * payloads can evolve (a message written by a newer schema stays readable for an older payload
+     * class); unknown-property drift that changes types still surfaces as a {@link
+     * LatchQDeserializationException}.
      */
     private static ObjectMapper newObjectMapper() {
         JsonFactory factory =
@@ -172,7 +196,7 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                                         .maxStringLength(Integer.MAX_VALUE)
                                         .build())
                         .build();
-        return new ObjectMapper(factory);
+        return new ObjectMapper(factory).disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
     }
 
     // ------------------------------------------------------------------
@@ -234,6 +258,7 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             if (checkpoint != null) {
                 restore = checkpoint.truncate();
                 emptyGapCorrections.putAll(checkpoint.corrections());
+                correctionsVersion.incrementAndGet();
                 long first = safeFirstIndex();
                 if (first >= 0 && restore < first) {
                     LOG.warn(
@@ -271,6 +296,10 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                             .start(this::checkpointLoop);
             this.cleanupThread =
                     Thread.ofVirtual().name("latchq-cleanup-" + name).start(this::cleanupLoop);
+            if (configuration.getSyncIntervalMillis() > 0) {
+                this.syncThread =
+                        Thread.ofVirtual().name("latchq-sync-" + name).start(this::syncLoop);
+            }
             this.initialized = true;
             LOG.info(
                     "LatchQueue '{}' for type {} initialized, directory={}, restoreIndex={}, rollCycle={}",
@@ -297,7 +326,9 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
         }
         running = false;
         for (Thread thread :
-                new Thread[] {scanThread, completeThread, checkpointThread, cleanupThread}) {
+                new Thread[] {
+                    scanThread, completeThread, checkpointThread, cleanupThread, syncThread
+                }) {
             if (thread != null) {
                 thread.interrupt();
                 try {
@@ -307,6 +338,9 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                 }
             }
         }
+        // wake consumers blocked in a read: they see the marker, re-post it for the next waiter
+        // and fail with a clear closed error (a full pending queue implies no take-waiters)
+        pending.offer(CLOSE_MARKER);
         // final checkpoint after the scan stopped: everything scanned is now reflected in the
         // truncate index, and the queue is still open for the write
         if (checkpointStore != null) {
@@ -318,6 +352,14 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             }
         }
         if (queue != null) {
+            // best-effort flush of the tail data before the mappings are released
+            for (ExcerptAppender appender : appenders) {
+                try {
+                    appender.sync();
+                } catch (Exception e) {
+                    LOG.warn("LatchQueue '{}' final appender sync failed", name, e);
+                }
+            }
             // The scan thread already closed its tailer; this also closes appenders registered
             // with the queue.
             queue.close();
@@ -377,8 +419,40 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
         if (appender == null) {
             appender = queue.createAppender();
             appenderThreadLocal.set(appender);
+            appenders.add(appender);
         }
         return appender;
+    }
+
+    /**
+     * Background sync task: periodically flushes every live appender's tail data to the OS/file
+     * ({@code appender.sync()} is an msync on the shared mapping with no thread affinity, so
+     * calling it from this thread while the owning writer keeps appending is safe; a racy position
+     * read only means a slightly smaller flushed prefix, caught up on the next tick). 0 disables.
+     */
+    private void syncLoop() {
+        long interval = configuration.getSyncIntervalMillis();
+        while (running && !closed) {
+            try {
+                Thread.sleep(interval);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            for (ExcerptAppender appender : appenders) {
+                try {
+                    appender.sync();
+                } catch (Exception e) {
+                    if (closed) {
+                        return; // shutdown raced the sweep, the final sync in close() covers it
+                    }
+                    LOG.warn(
+                            "LatchQueue '{}' appender sync failed, retrying next interval",
+                            name,
+                            e);
+                }
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -475,6 +549,7 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                         emptyGapCorrections.size());
             }
             emptyGapCorrections.put(provisional, realIndex);
+            correctionsVersion.incrementAndGet();
             LOG.info(
                     "LatchQueue '{}' recorded empty-gap correction [{}, {}) after an idle roll",
                     name,
@@ -496,6 +571,7 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
         seedPending = false;
         if (seedIndex >= 0 && firstReadIndex != seedIndex) {
             emptyGapCorrections.put(seedIndex, firstReadIndex);
+            correctionsVersion.incrementAndGet();
             LOG.info(
                     "LatchQueue '{}' recorded seed correction [{}, {}) on restore",
                     name,
@@ -519,13 +595,7 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
         }
         ensureUsable();
         LogEntryList<T> result = new LogEntryList<>();
-        BufferedLogEntry first;
-        try {
-            first = pending.take();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new LatchQException("interrupted while waiting for queue entries", e);
-        }
+        BufferedLogEntry first = takeOrThrow();
         result.add(deserialize(first));
         drainUpTo(result, count - 1);
         totalReadCount.add(result.size());
@@ -550,16 +620,46 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
         if (first == null) {
             return result;
         }
+        first = checkCloseMarker(first);
         result.add(deserialize(first));
         drainUpTo(result, count - 1);
         totalReadCount.add(result.size());
         return result;
     }
 
+    /** Takes the next entry, failing with a clear error when the close marker arrives. */
+    private BufferedLogEntry takeOrThrow() {
+        BufferedLogEntry entry;
+        try {
+            entry = pending.take();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new LatchQException("interrupted while waiting for queue entries", e);
+        }
+        return checkCloseMarker(entry);
+    }
+
+    /**
+     * Re-posts the close marker for the next waiting consumer and fails; re-posting succeeds
+     * without blocking because taking the marker just freed a slot.
+     */
+    private BufferedLogEntry checkCloseMarker(BufferedLogEntry entry) {
+        if (entry == CLOSE_MARKER) {
+            pending.offer(CLOSE_MARKER);
+            throw new LatchQException("queue '" + name + "' was closed while waiting for entries");
+        }
+        return entry;
+    }
+
     private void drainUpTo(LogEntryList<T> result, int maxAdditional) {
         for (int i = 0; i < maxAdditional; i++) {
             BufferedLogEntry entry = pending.poll();
             if (entry == null) {
+                return;
+            }
+            if (entry == CLOSE_MARKER) {
+                // leave the marker for other consumers; this batch simply ends here
+                pending.offer(CLOSE_MARKER);
                 return;
             }
             result.add(deserialize(entry));
@@ -571,11 +671,23 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             T data = objectMapper.readValue(entry.data(), type);
             return new LogEntry<>(data, entry.index(), entry.nextIndex());
         } catch (IOException e) {
-            throw new LatchQException(
+            // loud, even if the consumer swallows the exception: this entry needs a decision
+            LOG.error(
+                    "LatchQueue '{}' cannot deserialize message at index {} ({} bytes); skip it"
+                            + " via forceCommitGap({}, {}) or fix the payload class",
+                    name,
+                    entry.index(),
+                    entry.data().length,
+                    entry.index(),
+                    entry.nextIndex(),
+                    e);
+            throw new LatchQDeserializationException(
                     "cannot deserialize payload at index "
                             + entry.index()
                             + " as "
                             + type.getName(),
+                    entry.index(),
+                    entry.nextIndex(),
                     e);
         }
     }
@@ -739,6 +851,7 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                 if (bridged != null && bridged == range.start()) {
                     // the correction proves the gap is empty (idle roll): skip it at once
                     emptyGapCorrections.remove(newEnd);
+                    correctionsVersion.incrementAndGet();
                     newEnd = range.start();
                     gapDetected = false;
                     i--; // re-process the same range, which now connects
@@ -788,7 +901,10 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                     gapDetected = false;
                     continue; // keep merging behind the skipped gap
                 }
-                break; // ordinary gap: stop merging until it is filled
+                // ordinary gap: stop merging until it is filled; refresh the gap metric so it
+                // reflects the persisted stall even when no progress is made
+                currentGapCount.set(countGaps(newEnd));
+                break;
             }
         } finally {
             rangesLock.unlock();
@@ -805,7 +921,7 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             } finally {
                 rangesLock.unlock();
             }
-            LOG.info(
+            LOG.debug(
                     "LatchQueue '{}' advanced truncate index to {} ({} ranges merged)",
                     name,
                     newEnd,
@@ -819,7 +935,9 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             }
         }
         // corrections below the truncate point are consumed forever
-        emptyGapCorrections.keySet().removeIf(key -> key < truncateBeforeIndex.get());
+        if (emptyGapCorrections.keySet().removeIf(key -> key < truncateBeforeIndex.get())) {
+            correctionsVersion.incrementAndGet();
+        }
     }
 
     /** Counts discontinuities between the truncate point and the committed ranges. */
@@ -850,14 +968,21 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
     private void checkpointLoop() {
         while (running && !closed) {
             long truncate = truncateBeforeIndex.get();
-            try {
-                checkpointStore.write(truncate, java.util.Map.copyOf(emptyGapCorrections));
-                persistedTruncate.set(truncate);
-            } catch (Exception e) {
-                if (closed) {
-                    return; // shutdown interrupt landed mid-write, the final checkpoint covers it
+            long version = correctionsVersion.get();
+            // an fsync-per-tick on an idle queue is pure wear; write only on real progress
+            if (truncate != persistedTruncate.get()
+                    || version != persistedCorrectionsVersion.get()) {
+                try {
+                    checkpointStore.write(truncate, java.util.Map.copyOf(emptyGapCorrections));
+                    persistedTruncate.set(truncate);
+                    persistedCorrectionsVersion.set(version);
+                } catch (Exception e) {
+                    if (closed) {
+                        return; // shutdown interrupt landed mid-write, the final checkpoint covers
+                        // it
+                    }
+                    LOG.error("LatchQueue '{}' checkpoint write failed", name, e);
                 }
-                LOG.error("LatchQueue '{}' checkpoint write failed", name, e);
             }
             try {
                 Thread.sleep(configuration.getCheckpointIntervalMillis());
@@ -1067,7 +1192,8 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                     }
                     if (out == null) {
                         Path file = Path.of(targetDirectory, filePrefix + fileIndex++ + fileSuffix);
-                        out = Files.newOutputStream(file);
+                        // buffered: without it every entry costs two unbuffered write syscalls
+                        out = new BufferedOutputStream(Files.newOutputStream(file), 1 << 16);
                         filePaths.add(file.toString());
                         entriesInFile = 0;
                     }
