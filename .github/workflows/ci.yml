@@ -9,8 +9,13 @@ on:
 
 jobs:
   verify:
-    name: Build, test and quality gates
-    runs-on: ubuntu-latest
+    name: Build, test and quality gates (${{ matrix.os }})
+    strategy:
+      # run every OS to the end so one failing platform cannot hide the other's result
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,15 +28,19 @@ jobs:
           cache: maven
 
       - name: Build, test and verify (tests + jacoco + spotless)
+        # bash works on both runners: .gitattributes keeps mvnw LF-ended, so the
+        # wrapper script also runs under Git Bash on Windows
         # the surefire argLine in the root pom already carries the JDK 21 JVM opens
         # required by Chronicle; spotless:check and jacoco are bound to verify
+        shell: bash
         run: ./mvnw --batch-mode verify
 
       - name: Upload test reports on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-reports
+          # artifact names must be unique across matrix jobs
+          name: test-reports-${{ matrix.os }}
           path: '**/target/surefire-reports/**'
           retention-days: 7
 
@@ -39,7 +48,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: jacoco-report
+          name: jacoco-report-${{ matrix.os }}
           path: '**/target/site/jacoco/**'
           retention-days: 7
 
