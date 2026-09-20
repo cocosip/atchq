@@ -2,6 +2,8 @@ package io.github.cocosip.sample.springboot;
 
 import io.github.cocosip.latchq.LatchQueue;
 import io.github.cocosip.latchq.LatchQueueFactory;
+import io.github.cocosip.latchq.LogEntryList;
+import io.github.cocosip.latchq.exception.LatchQDeserializationException;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import java.time.Duration;
@@ -57,7 +59,20 @@ public class AuditEventConsumer {
 
     private void consumeLoop() {
         while (running.get()) {
-            var batch = queue.read(20, Duration.ofMillis(500));
+            LogEntryList<AuditEvent> batch;
+            try {
+                batch = queue.read(20, Duration.ofMillis(500));
+            } catch (LatchQDeserializationException e) {
+                // poison message: abandon it explicitly, otherwise it is re-delivered after a
+                // restart (see the README section on payload drift)
+                LOG.error(
+                        "poison message at [{}, {}) - skipping it via forceCommitGap",
+                        e.getIndex(),
+                        e.getNextIndex(),
+                        e);
+                queue.forceCommitGap(e.getIndex(), e.getNextIndex());
+                continue;
+            }
             if (batch.isEmpty()) {
                 continue;
             }
