@@ -260,6 +260,8 @@ public class LatchQueueConfiguration {
 
 配置查找行为与 FASTER 版不同:**fail-fast**——FASTER 版 `GetConfiguration(name)` 找不到时静默回退 default 配置,LatchQ 改为直接抛 `LatchQInvalidConfigurationException`,避免拼错队列名时意外落到错误配置。
 
+关于 API 边界的一点说明:`builderCustomizer` 是 LatchQ 公共 API 中**唯一**允许出现的 Chronicle 类型(`SingleChronicleQueueBuilder`)——它的存在意义就是把 Chronicle 原生构建器直接交给高级调用方(在 blockSize/rollCycle 之后应用,可覆盖一切),封装反而使其失效,属有意豁免。除此之外的 Chronicle 类型一律收敛在 `io.github.cocosip.latchq.internal` 内部,不得出现在公共 API 签名中。
+
 存储目录规则:`rootPath/<类型全限定名(非法字符清洗)>/<fileName>/`,与 FASTER 版一致(name 只用于选择配置、不进路径);checkpoint 文件(`checkpoint`)放在队列目录内,随队列一起管理。同一 JVM 内可并存多个不同类型、不同名称的队列实例(对应需求"支持多个不同类型的日志")。
 
 `latchq-spring-boot-starter` 把 `LatchQueueOptions` 暴露为 `@ConfigurationProperties(prefix = "latchq")`,支持 YAML/Properties 配置。

@@ -42,7 +42,9 @@ to Chronicle Queue.
 - Formatting is enforced by Spotless (google-java-format, AOSP style, 4-space indent). Run
   `./mvnw spotless:apply` before committing.
 - Chronicle types (`ExcerptAppender`, `ExcerptTailer`, `Wire`, ...) must not leak into the public
-  API; keep them inside `io.github.cocosip.latchq.internal`.
+  API; keep them inside `io.github.cocosip.latchq.internal`. The one sanctioned exception is the
+  `builderCustomizer` hook in `LatchQueueConfiguration`, which exists precisely to hand advanced
+  users the native `SingleChronicleQueueBuilder` (see the design document, chapter 8).
 - Known behavioural constraints discovered in M0 (see `docs/spike-notes.md`) must be respected:
   scan threads use unnamed tailers only; message positions are chained via read-ahead stamped
   real next indexes (with provisional in-cycle tail delivery plus empty-gap corrections);
