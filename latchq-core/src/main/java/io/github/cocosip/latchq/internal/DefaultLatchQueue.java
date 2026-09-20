@@ -25,12 +25,14 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import net.openhft.chronicle.queue.ChronicleQueue;
@@ -76,6 +78,9 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
     private final ObjectMapper objectMapper = newObjectMapper();
     private final Path queueDirectory;
 
+    /** Folded absolute path this instance registered in {@link #OPEN_QUEUE_DIRECTORIES}. */
+    private String openDirectoryKey;
+
     private final Object lifecycleLock = new Object();
     private volatile boolean initialized;
     private volatile boolean closed;
@@ -95,8 +100,25 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
      */
     private static final BufferedLogEntry CLOSE_MARKER = new BufferedLogEntry(new byte[0], -1, -1);
 
+    /**
+     * Queue directories currently held by live instances in this JVM, keyed by absolute path folded
+     * to lower case. Two live instances on one directory would interleave checkpoints and cleanup
+     * on the same storage; the fold also catches distinct configurations that collapse onto one
+     * directory on case-insensitive filesystems (Windows/macOS), e.g. fileNames differing only in
+     * case (the configured fileName is normalized to lower case for the directory name).
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<String, Boolean>
+            OPEN_QUEUE_DIRECTORIES = new java.util.concurrent.ConcurrentHashMap<>();
+
     /** Appenders created by this session, synced periodically per {@code syncIntervalMillis}. */
     private final Set<ExcerptAppender> appenders = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Exports currently in flight. Cycle cleanup is suspended while one is running: an export may
+     * legitimately read cycles behind the persisted checkpoint (disaster recovery), and deleting
+     * those files mid-scan would truncate the export silently.
+     */
+    private final AtomicInteger activeExports = new AtomicInteger();
 
     /** Bumped whenever the empty-gap corrections change, so idle checkpoints can be skipped. */
     private final AtomicLong correctionsVersion = new AtomicLong();
@@ -220,94 +242,118 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             } catch (IOException e) {
                 throw new LatchQException("cannot create queue directory " + queueDirectory, e);
             }
-            RollCycle rollCycle = RollCycleResolver.resolve(configuration.getRollCycle());
-            // M1 finding: Chronicle caps a single write at blockSize/2 - 4 bytes, so the block
-            // size is derived from maxMessageSizeBytes to make the configured bound authoritative
-            long blockSize =
-                    Math.max(
-                            DEFAULT_BLOCK_SIZE_BYTES,
-                            configuration.getMaxMessageSizeBytes() * 2 + 128);
-            var builder =
-                    ChronicleQueue.singleBuilder(queueDirectory.toString())
-                            .rollCycle(rollCycle)
-                            .blockSize(blockSize)
-                            .storeFileListener(
-                                    new StoreFileListener() {
-                                        @Override
-                                        public void onAcquired(int cycle, java.io.File file) {
-                                            acquiredCycleFiles.put(cycle, file);
-                                        }
-
-                                        @Override
-                                        public void onReleased(int cycle, java.io.File file) {
-                                            // kept in the map: released files are still deletable
-                                            // by
-                                            // the cleanup rule below the persisted checkpoint
-                                        }
-                                    });
-            if (configuration.getBuilderCustomizer() != null) {
-                configuration.getBuilderCustomizer().accept(builder);
+            // refuse a second live instance on the same storage directory (checkpoints and
+            // cleanup would interleave); see OPEN_QUEUE_DIRECTORIES for why the key is folded
+            String directoryKey =
+                    queueDirectory.toAbsolutePath().normalize().toString().toLowerCase(Locale.ROOT);
+            if (OPEN_QUEUE_DIRECTORIES.putIfAbsent(directoryKey, Boolean.TRUE) != null) {
+                throw new LatchQException(
+                        "queue directory "
+                                + queueDirectory
+                                + " is already opened by another LatchQueue instance in this JVM;"
+                                + " share the instance via LatchQueueFactory or LatchQueueHolder"
+                                + " instead");
             }
-            this.queue = builder.build();
+            this.openDirectoryKey = directoryKey;
+            try {
+                RollCycle rollCycle = RollCycleResolver.resolve(configuration.getRollCycle());
+                // M1 finding: Chronicle caps a single write at blockSize/2 - 4 bytes, so the block
+                // size is derived from maxMessageSizeBytes to make the configured bound
+                // authoritative
+                long blockSize =
+                        Math.max(
+                                DEFAULT_BLOCK_SIZE_BYTES,
+                                configuration.getMaxMessageSizeBytes() * 2 + 128);
+                var builder =
+                        ChronicleQueue.singleBuilder(queueDirectory.toString())
+                                .rollCycle(rollCycle)
+                                .blockSize(blockSize)
+                                .storeFileListener(
+                                        new StoreFileListener() {
+                                            @Override
+                                            public void onAcquired(int cycle, java.io.File file) {
+                                                acquiredCycleFiles.put(cycle, file);
+                                            }
 
-            // Restore the consumer position from the persisted checkpoint (clamped by
-            // firstIndex so a stale checkpoint cannot point into cleaned-up territory).
-            this.checkpointStore = new CheckpointStore(queueDirectory);
-            CheckpointStore.Checkpoint checkpoint = checkpointStore.read();
-            long restore;
-            if (checkpoint != null) {
-                restore = checkpoint.truncate();
-                emptyGapCorrections.putAll(checkpoint.corrections());
-                correctionsVersion.incrementAndGet();
-                long first = safeFirstIndex();
-                if (first >= 0 && restore < first) {
-                    LOG.warn(
-                            "LatchQueue '{}' checkpoint index {} is below the earliest existing message {}; resuming from {}",
-                            name,
-                            restore,
-                            first,
-                            first);
-                    restore = first;
+                                            @Override
+                                            public void onReleased(int cycle, java.io.File file) {
+                                                // kept in the map: released files are still
+                                                // deletable
+                                                // by
+                                                // the cleanup rule below the persisted checkpoint
+                                            }
+                                        });
+                if (configuration.getBuilderCustomizer() != null) {
+                    configuration.getBuilderCustomizer().accept(builder);
                 }
-            } else {
-                restore = safeFirstIndex();
-            }
-            truncateBeforeIndex.set(restore);
-            persistedTruncate.set(checkpoint != null ? checkpoint.truncate() : -1);
-            // seed correction: the first real read after a restart that lands past the seed
-            // index proves the range [seed, index) holds no messages, bridging a provisional
-            // checkpoint across an idle roll
-            this.seedIndex = restore;
-            this.seedPending = restore >= 0;
+                this.queue = builder.build();
 
-            final long restoreIndex = restore;
-            this.running = true;
-            // The tailer is created, used and closed entirely on the scan thread: Chronicle
-            // resources are single-threaded (ThreadingIllegalStateException otherwise).
-            this.scanThread =
-                    Thread.ofVirtual()
-                            .name("latchq-scan-" + name)
-                            .start(() -> scanLoop(restoreIndex));
-            this.completeThread =
-                    Thread.ofVirtual().name("latchq-complete-" + name).start(this::completeLoop);
-            this.checkpointThread =
-                    Thread.ofVirtual()
-                            .name("latchq-checkpoint-" + name)
-                            .start(this::checkpointLoop);
-            this.cleanupThread =
-                    Thread.ofVirtual().name("latchq-cleanup-" + name).start(this::cleanupLoop);
-            if (configuration.getSyncIntervalMillis() > 0) {
-                this.syncThread =
-                        Thread.ofVirtual().name("latchq-sync-" + name).start(this::syncLoop);
+                // Restore the consumer position from the persisted checkpoint (clamped by
+                // firstIndex so a stale checkpoint cannot point into cleaned-up territory).
+                this.checkpointStore = new CheckpointStore(queueDirectory);
+                CheckpointStore.Checkpoint checkpoint = checkpointStore.read();
+                long restore;
+                if (checkpoint != null) {
+                    restore = checkpoint.truncate();
+                    emptyGapCorrections.putAll(checkpoint.corrections());
+                    correctionsVersion.incrementAndGet();
+                    long first = safeFirstIndex();
+                    if (first >= 0 && restore < first) {
+                        LOG.warn(
+                                "LatchQueue '{}' checkpoint index {} is below the earliest existing message {}; resuming from {}",
+                                name,
+                                restore,
+                                first,
+                                first);
+                        restore = first;
+                    }
+                } else {
+                    restore = safeFirstIndex();
+                }
+                truncateBeforeIndex.set(restore);
+                persistedTruncate.set(checkpoint != null ? checkpoint.truncate() : -1);
+                // seed correction: the first real read after a restart that lands past the seed
+                // index proves the range [seed, index) holds no messages, bridging a provisional
+                // checkpoint across an idle roll
+                this.seedIndex = restore;
+                this.seedPending = restore >= 0;
+
+                final long restoreIndex = restore;
+                this.running = true;
+                // The tailer is created, used and closed entirely on the scan thread: Chronicle
+                // resources are single-threaded (ThreadingIllegalStateException otherwise).
+                this.scanThread =
+                        Thread.ofVirtual()
+                                .name("latchq-scan-" + name)
+                                .start(() -> scanLoop(restoreIndex));
+                this.completeThread =
+                        Thread.ofVirtual()
+                                .name("latchq-complete-" + name)
+                                .start(this::completeLoop);
+                this.checkpointThread =
+                        Thread.ofVirtual()
+                                .name("latchq-checkpoint-" + name)
+                                .start(this::checkpointLoop);
+                this.cleanupThread =
+                        Thread.ofVirtual().name("latchq-cleanup-" + name).start(this::cleanupLoop);
+                if (configuration.getSyncIntervalMillis() > 0) {
+                    this.syncThread =
+                            Thread.ofVirtual().name("latchq-sync-" + name).start(this::syncLoop);
+                }
+                this.initialized = true;
+                LOG.info(
+                        "LatchQueue '{}' for type {} initialized, directory={}, restoreIndex={}, rollCycle={}",
+                        name,
+                        type.getName(),
+                        queueDirectory,
+                        restore,
+                        rollCycle);
+            } catch (RuntimeException e) {
+                // release the directory guard so a retried initialize() is not locked out
+                OPEN_QUEUE_DIRECTORIES.remove(directoryKey);
+                this.openDirectoryKey = null;
+                throw e;
             }
-            this.initialized = true;
-            LOG.info(
-                    "LatchQueue '{}' for type {} initialized, directory={}, restoreIndex={}, rollCycle={}",
-                    name,
-                    type.getName(),
-                    queueDirectory,
-                    restore,
-                    rollCycle);
         }
     }
 
@@ -339,8 +385,29 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             }
         }
         // wake consumers blocked in a read: they see the marker, re-post it for the next waiter
-        // and fail with a clear closed error (a full pending queue implies no take-waiters)
-        pending.offer(CLOSE_MARKER);
+        // and fail with a clear closed error. The offer can transiently fail while the hand-off
+        // queue is still full; nothing refills it once the scan thread has stopped, so a bounded
+        // retry outlasts the drain and also reaches a consumer that passed its usability check
+        // before close() but has not reached take() yet. Giving up strands at most a consumer
+        // blocked on an empty take(), which only an interrupt can then release - hence the log.
+        long wakeDeadline = System.nanoTime() + TimeUnit.MILLISECONDS.toMillis(2000);
+        while (true) {
+            try {
+                if (pending.offer(CLOSE_MARKER, 10, TimeUnit.MILLISECONDS)) {
+                    break;
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            if (System.nanoTime() - wakeDeadline >= 0) {
+                LOG.warn(
+                        "LatchQueue '{}' hand-off queue stayed full during shutdown; a consumer"
+                                + " waiting for entries may remain blocked until interrupted",
+                        name);
+                break;
+            }
+        }
         // final checkpoint after the scan stopped: everything scanned is now reflected in the
         // truncate index, and the queue is still open for the write
         if (checkpointStore != null) {
@@ -362,7 +429,14 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             }
             // The scan thread already closed its tailer; this also closes appenders registered
             // with the queue.
-            queue.close();
+            try {
+                queue.close();
+            } finally {
+                if (openDirectoryKey != null) {
+                    OPEN_QUEUE_DIRECTORIES.remove(openDirectoryKey);
+                    openDirectoryKey = null;
+                }
+            }
         }
         LOG.info("LatchQueue '{}' for type {} closed", name, type.getName());
     }
@@ -1025,6 +1099,9 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
      * briefly after close) are tolerated and retried on the next tick.
      */
     private void cleanupCycleFiles() {
+        if (activeExports.get() > 0) {
+            return; // an export may be reading behind the checkpoint; never delete under it
+        }
         long persisted = persistedTruncate.get();
         if (persisted < 0) {
             return; // nothing persisted yet: never delete based on memory state alone
@@ -1153,82 +1230,92 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
         if (actualFrom >= toExclusive) {
             return new ExportResult(filePaths, 0, actualFrom, actualFrom);
         }
+        // an export may be reading cycles behind the persisted checkpoint (disaster recovery);
+        // suspend cleanup for the duration so those files cannot be deleted mid-scan
+        activeExports.incrementAndGet();
         try {
-            Files.createDirectories(Path.of(targetDirectory));
-        } catch (IOException e) {
-            throw new LatchQException("cannot create export directory " + targetDirectory, e);
-        }
-        String filePrefix = TypeStorageNaming.sanitize(type.getName()) + "_" + actualFrom + "_part";
-        String fileSuffix =
-                "_"
-                        + DateTimeFormatter.ofPattern("yyyyMMddHHmmssSSS")
-                                .format(LocalDateTime.now())
-                        + "_"
-                        + Long.toHexString(System.nanoTime() & 0xFFFFF)
-                        + ".jsonl";
+            try {
+                Files.createDirectories(Path.of(targetDirectory));
+            } catch (IOException e) {
+                throw new LatchQException("cannot create export directory " + targetDirectory, e);
+            }
+            String filePrefix =
+                    TypeStorageNaming.sanitize(type.getName()) + "_" + actualFrom + "_part";
+            String fileSuffix =
+                    "_"
+                            + DateTimeFormatter.ofPattern("yyyyMMddHHmmssSSS")
+                                    .format(LocalDateTime.now())
+                            + "_"
+                            + Long.toHexString(System.nanoTime() & 0xFFFFF)
+                            + ".jsonl";
 
-        long count = 0;
-        long lastReadIndex = -1;
-        int fileIndex = 0;
-        int entriesInFile = 0;
-        java.io.OutputStream out = null;
-        try (ExcerptTailer tailer = queue.createTailer()) { // isolated from the consumer position
-            if (actualFrom >= 0) {
-                tailer.moveToIndex(actualFrom);
-            }
-            while (true) {
-                try (DocumentContext ctx = tailer.readingDocument()) {
-                    if (!ctx.isPresent()) {
-                        break;
+            long count = 0;
+            long lastReadIndex = -1;
+            int fileIndex = 0;
+            int entriesInFile = 0;
+            java.io.OutputStream out = null;
+            try (ExcerptTailer tailer =
+                    queue.createTailer()) { // isolated from the consumer position
+                if (actualFrom >= 0) {
+                    tailer.moveToIndex(actualFrom);
+                }
+                while (true) {
+                    try (DocumentContext ctx = tailer.readingDocument()) {
+                        if (!ctx.isPresent()) {
+                            break;
+                        }
+                        long index = ctx.index();
+                        if (index >= toExclusive) {
+                            break;
+                        }
+                        byte[][] holder = new byte[1][];
+                        ctx.wire().readBytes(in -> holder[0] = in.toByteArray());
+                        if (holder[0].length == 0) {
+                            continue; // phantom document at a cleaned-up position, skip forward
+                        }
+                        if (out == null) {
+                            Path file =
+                                    Path.of(targetDirectory, filePrefix + fileIndex++ + fileSuffix);
+                            // buffered: without it every entry costs two unbuffered write syscalls
+                            out = new BufferedOutputStream(Files.newOutputStream(file), 1 << 16);
+                            filePaths.add(file.toString());
+                            entriesInFile = 0;
+                        }
+                        out.write(holder[0]);
+                        out.write('\n');
+                        count++;
+                        entriesInFile++;
+                        lastReadIndex = index;
+                        if (entriesInFile >= entriesPerFile) {
+                            out.close();
+                            out = null;
+                        }
                     }
-                    long index = ctx.index();
-                    if (index >= toExclusive) {
-                        break;
-                    }
-                    byte[][] holder = new byte[1][];
-                    ctx.wire().readBytes(in -> holder[0] = in.toByteArray());
-                    if (holder[0].length == 0) {
-                        continue; // phantom document at a cleaned-up position, skip forward
-                    }
-                    if (out == null) {
-                        Path file = Path.of(targetDirectory, filePrefix + fileIndex++ + fileSuffix);
-                        // buffered: without it every entry costs two unbuffered write syscalls
-                        out = new BufferedOutputStream(Files.newOutputStream(file), 1 << 16);
-                        filePaths.add(file.toString());
-                        entriesInFile = 0;
-                    }
-                    out.write(holder[0]);
-                    out.write('\n');
-                    count++;
-                    entriesInFile++;
-                    lastReadIndex = index;
-                    if (entriesInFile >= entriesPerFile) {
+                }
+            } catch (IOException e) {
+                throw new LatchQException("export failed after " + count + " entries", e);
+            } finally {
+                if (out != null) {
+                    try {
                         out.close();
-                        out = null;
+                    } catch (IOException e) {
+                        LOG.warn("LatchQueue '{}' failed to close the last export file", name, e);
                     }
                 }
             }
-        } catch (IOException e) {
-            throw new LatchQException("export failed after " + count + " entries", e);
+            LOG.info(
+                    "LatchQueue '{}' exported {} entries from index {} into {} file(s)",
+                    name,
+                    count,
+                    actualFrom,
+                    filePaths.size());
+            // exclusive upper bound for the next incremental export; an empty export keeps
+            // toIndex == fromIndex (mirroring the FASTER reference result)
+            long resultTo = count == 0 ? actualFrom : lastReadIndex + 1;
+            return new ExportResult(filePaths, count, actualFrom, resultTo);
         } finally {
-            if (out != null) {
-                try {
-                    out.close();
-                } catch (IOException e) {
-                    LOG.warn("LatchQueue '{}' failed to close the last export file", name, e);
-                }
-            }
+            activeExports.decrementAndGet();
         }
-        LOG.info(
-                "LatchQueue '{}' exported {} entries from index {} into {} file(s)",
-                name,
-                count,
-                actualFrom,
-                filePaths.size());
-        // exclusive upper bound for the next incremental export; an empty export keeps
-        // toIndex == fromIndex (mirroring the FASTER reference result)
-        long resultTo = count == 0 ? actualFrom : lastReadIndex + 1;
-        return new ExportResult(filePaths, count, actualFrom, resultTo);
     }
 
     // ------------------------------------------------------------------
@@ -1244,21 +1331,30 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
     @Override
     public long lastIndexAppended() {
         ensureUsable();
-        if (queue == null) {
-            return -1;
-        }
         long first = safeFirstIndex();
         if (first < 0) {
             return -1;
         }
-        long last = queue.lastIndex();
+        long last;
+        try {
+            last = queue.lastIndex();
+        } catch (RuntimeException e) {
+            // close() racing the read releases the underlying queue; report unknown, mirroring
+            // the tolerant firstIndex handling
+            LOG.warn("LatchQueue '{}' failed to read lastIndex, treating as empty", name, e);
+            return -1;
+        }
         return last < 0 ? -1 : last;
     }
 
     @Override
     public LatchQueueMetrics metrics() {
-        long first = queue == null || closed ? -1 : safeFirstIndex();
-        long last = queue == null || closed ? -1 : lastIndexAppended();
+        // deliberately callable in any lifecycle state (health endpoints call it): storage fields
+        // read as -1 while uninitialized or closed. The initialized flag - not queue != null - is
+        // the right guard, because initialize() assigns the queue field before flipping the flag.
+        boolean usable = initialized && !closed;
+        long first = usable ? safeFirstIndex() : -1;
+        long last = usable ? lastIndexAppended() : -1;
         rangesLock.lock();
         int rangeCount;
         try {

@@ -97,4 +97,25 @@ class LatchQueueCloseTest {
         assertThat(consumer.isAlive()).isFalse();
         assertThat(thrown.get()).isInstanceOf(LatchQException.class).hasMessageContaining("closed");
     }
+
+    @Test
+    void closeCompletesWhenHandOffQueueIsFullAndNobodyDrains() {
+        LatchQueue<Event> queue =
+                LatchQueueBuilder.create("close-full", Event.class)
+                        .rootPath(BASE.toString())
+                        .configuration(
+                                c -> {
+                                    c.setFileName("close-full");
+                                    c.setPreReadCapacity(4);
+                                })
+                        .build();
+        for (int i = 0; i < 20; i++) {
+            queue.write(new Event(i));
+        }
+        // no consumer ever drains the hand-off queue: the wake marker cannot be enqueued, and
+        // close() must give up after its bounded grace period instead of hanging
+        long start = System.nanoTime();
+        queue.close();
+        assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(10));
+    }
 }

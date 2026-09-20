@@ -37,7 +37,11 @@ public final class LatchQueueBuilder<T> {
         return new LatchQueueBuilder<>(name, type, new LatchQueueOptions());
     }
 
-    /** Builds the queue against externally managed options (the name must be registered there). */
+    /**
+     * Builds the queue against externally managed options. Unlike the factory path, an unknown name
+     * is not an error here: the name is registered in the options automatically (with a default
+     * configuration when absent) so {@code configuration(...)} can amend it afterwards.
+     */
     public static <T> LatchQueueBuilder<T> create(
             String name, Class<T> type, LatchQueueOptions options) {
         return new LatchQueueBuilder<>(name, type, options);

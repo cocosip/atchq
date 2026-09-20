@@ -287,6 +287,32 @@ class LatchQueueIntegrationTest {
     }
 
     @Test
+    void metricsIsCallableInAnyLifecycleState() {
+        purgeBase();
+        LatchQueueOptions options = new LatchQueueOptions();
+        options.setRootPath(BASE.toString());
+        options.configure("metrics-raw", c -> c.setFileName("metrics-raw"));
+        DefaultLatchQueue<Event> queue =
+                new DefaultLatchQueue<>(
+                        "metrics-raw",
+                        Event.class,
+                        options,
+                        options.getConfiguration("metrics-raw"));
+        // before initialize(): the storage fields read as -1 instead of throwing, even inside
+        // the window where initialize() has built the queue but not flipped the flag
+        LatchQueueMetrics before = queue.metrics();
+        assertThat(before.truncateBeforeIndex()).isNegative();
+        assertThat(before.firstIndex()).isNegative();
+        assertThat(before.lastIndexAppended()).isNegative();
+        queue.initialize();
+        assertThat(queue.metrics().firstIndex()).isNegative(); // empty queue
+        queue.write(new Event(1, "x"));
+        assertThat(queue.metrics().lastIndexAppended()).isPositive();
+        queue.close();
+        assertThat(queue.metrics().lastIndexAppended()).isNegative();
+    }
+
+    @Test
     void closedQueueRejectsFurtherUseAndCloseIsIdempotent() {
         purgeBase();
         LatchQueue<Event> queue = newQueue("closed");
