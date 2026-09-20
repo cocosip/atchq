@@ -1,0 +1,8 @@
+# The Maven wrapper is a bash script and must keep LF endings so it runs on
+# every OS, including Git Bash on Windows runners (CRLF breaks the shebang).
+mvnw text eol=lf
+*.sh text eol=lf
+
+# Windows batch scripts must keep CRLF endings for cmd.exe.
+*.cmd text eol=crlf
+*.bat text eol=crlf
