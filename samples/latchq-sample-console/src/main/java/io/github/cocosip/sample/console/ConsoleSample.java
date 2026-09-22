@@ -3,7 +3,9 @@ package io.github.cocosip.sample.console;
 import io.github.cocosip.latchq.LatchQueue;
 import io.github.cocosip.latchq.LatchQueueBuilder;
 import io.github.cocosip.latchq.LogEntry;
+import io.github.cocosip.latchq.exception.LatchQDeserializationException;
 import java.time.Duration;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -57,17 +59,35 @@ public final class ConsoleSample {
 
     private void consumeLoop() {
         while (consumed.get() < TOTAL) {
-            var batch = queue.read(10, Duration.ofMillis(500));
-            if (batch.isEmpty()) {
+            List<LogEntry<Order>> batch;
+            try {
+                batch = queue.read(10, Duration.ofMillis(500));
+            } catch (LatchQDeserializationException e) {
+                // poison message: process what was read before it, then abandon the poison
+                // entry explicitly so it is not re-delivered after a restart
+                processAndCommit(e.getSuccessfullyRead());
+                System.out.println(
+                        "poison message at ["
+                                + e.getIndex()
+                                + ", "
+                                + e.getNextIndex()
+                                + ") - skipped via forceCommitGap");
+                queue.forceCommitGap(e.getIndex(), e.getNextIndex());
                 continue;
             }
-            // process each entry (idempotently in production!), then commit its position
-            for (LogEntry<Order> entry : batch) {
-                System.out.println(
-                        Thread.currentThread().threadId() + " processed " + entry.data());
-            }
-            queue.commit(batch.stream().map(LogEntry::position).toList());
-            consumed.addAndGet(batch.size());
+            processAndCommit(batch);
         }
+    }
+
+    private void processAndCommit(List<LogEntry<Order>> entries) {
+        if (entries.isEmpty()) {
+            return;
+        }
+        // process each entry (idempotently in production!), then commit its position
+        for (LogEntry<Order> entry : entries) {
+            System.out.println(Thread.currentThread().threadId() + " processed " + entry.data());
+        }
+        queue.commit(entries.stream().map(LogEntry::position).toList());
+        consumed.addAndGet(entries.size());
     }
 }
