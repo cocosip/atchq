@@ -89,6 +89,14 @@
                     <groupId>org.apache.maven.plugins</groupId>
                     <artifactId>maven-compiler-plugin</artifactId>
                     <version>3.13.0</version>
+                    <configuration>
+                        <!-- every javac lint category on except -processing (Spring annotations
+                             are claimed by no compilation processor by design); warnings fail -->
+                        <compilerArgs>
+                            <arg>-Xlint:all,-processing</arg>
+                            <arg>-Werror</arg>
+                        </compilerArgs>
+                    </configuration>
                 </plugin>
                 <plugin>
                     <groupId>org.apache.maven.plugins</groupId>
