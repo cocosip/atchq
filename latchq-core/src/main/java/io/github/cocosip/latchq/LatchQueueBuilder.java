@@ -2,7 +2,6 @@ package io.github.cocosip.latchq;
 
 import io.github.cocosip.latchq.config.LatchQueueConfiguration;
 import io.github.cocosip.latchq.config.LatchQueueOptions;
-import io.github.cocosip.latchq.exception.LatchQException;
 import io.github.cocosip.latchq.internal.DefaultLatchQueue;
 import java.util.Objects;
 import java.util.function.Consumer;
@@ -57,16 +56,16 @@ public final class LatchQueueBuilder<T> {
         return this;
     }
 
-    /** Validates the options, initializes the queue and returns it. */
+    /**
+     * Validates the options, initializes the queue and returns it. Configuration problems surface
+     * as {@link io.github.cocosip.latchq.exception.LatchQInvalidConfigurationException}, matching
+     * the factory path, so callers can catch them by type.
+     */
     public LatchQueue<T> build() {
         options.validate();
-        try {
-            DefaultLatchQueue<T> queue =
-                    new DefaultLatchQueue<>(name, type, options, options.getConfiguration(name));
-            queue.initialize();
-            return queue;
-        } catch (RuntimeException e) {
-            throw new LatchQException("failed to build queue '" + name + "': " + e.getMessage(), e);
-        }
+        DefaultLatchQueue<T> queue =
+                new DefaultLatchQueue<>(name, type, options, options.getConfiguration(name));
+        queue.initialize();
+        return queue;
     }
 }

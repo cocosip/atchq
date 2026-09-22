@@ -127,9 +127,9 @@ the semantics survive the Chronicle migration:
 | `maxMessageSizeBytes` | 20 MiB (20971520) | per-message serialized size cap; larger writes are rejected with a clear error before touching storage. Raise it to admit bigger messages (each appender allocates a derived buffer, so very large values multiply with writer threads and may need `-XX:MaxDirectMemorySize`) |
 | `rollCycle` | `DEFAULT` | Chronicle roll cycle name (resolved from the `RollCycles` constants, e.g. `FAST_DAILY`, `TWO_HOURLY`); carries the capacity semantics |
 | `syncIntervalMillis` | 2000 | periodic `appender.sync()` flush; controls the crash-durability window (0 disables periodic syncing) |
-| `completeIntervalMillis` | 3000 | interval of the background range-merging task |
-| `checkpointIntervalMillis` | 2000 | interval of the atomic checkpoint persistence task |
-| `cleanupIntervalMillis` | 300000 | interval of the consumed-cycle-file cleanup task |
+| `completeIntervalMillis` | 3000 | interval of the background range-merging task (must be positive) |
+| `checkpointIntervalMillis` | 2000 | interval of the atomic checkpoint persistence task (must be positive) |
+| `cleanupIntervalMillis` | 300000 | interval of the consumed-cycle-file cleanup task (must be positive) |
 | `preReadCapacity` | 5000 | bounded queue capacity between the scan thread and consumers |
 | `gapTimeoutMillis` | 600000 | delay before the first gap warning and between repeated warnings |
 | `forceCompleteGapTimeoutMillis` | 120000 | gap force-skip timeout; 0 disables timeout-driven skipping (range overflow still forces) |
@@ -149,24 +149,30 @@ recorded corrections and never need a force-skip.
 
 An entry that no longer deserializes into the configured payload type (typically a schema that
 drifted from stored JSON) makes `read` throw a `LatchQDeserializationException` carrying the
-entry's index range. The failed entry is gone for the running session; skip it explicitly to
-keep consuming durably:
+entry's index range plus the entries of the same batch that were read before it. The failed
+entry is gone for the running session; skip it explicitly to keep consuming durably:
 
 ```java
 try {
     batch = queue.read(100);
 } catch (LatchQDeserializationException e) {
+    // the entries read before the poison one travel inside the exception:
+    // process and commit them first, then skip the poison entry itself
+    processAll(e.getSuccessfullyRead());
+    queue.commit(e.getSuccessfullyRead().stream().map(LogEntry::position).toList());
     LOG.error("poison message at {}", e.getIndex(), e);
     queue.forceCommitGap(e.getIndex(), e.getNextIndex()); // abandon it, logged as ERROR
 }
 ```
 
-Without that call the entry is re-delivered after a restart (it was never committed), so a
-crash loop is possible until the payload class is fixed or the message is skipped. Known
-unknown JSON properties are ignored on read, so adding fields to a payload stays compatible in
-both directions; only type drift on existing fields poisons. Messages written by `batchWrite`
-are not atomic as a batch - if a write fails mid-batch, the earlier payloads are already
-durable but their indexes are lost.
+Committing the prefix matters: those entries were consumed but never acknowledged, and without
+their commit the merge would stall in front of the poison range until the force-skip timeout
+abandons it together with the prefix. Without the `forceCommitGap` call the failed entry is
+re-delivered after a restart (it was never committed), so a crash loop is possible until the
+payload class is fixed or the message is skipped. Known unknown JSON properties are ignored on
+read, so adding fields to a payload stays compatible in both directions; only type drift on
+existing fields poisons. Messages written by `batchWrite` are not atomic as a batch - if a
+write fails mid-batch, the earlier payloads are already durable but their indexes are lost.
 
 ## Shutdown behaviour
 

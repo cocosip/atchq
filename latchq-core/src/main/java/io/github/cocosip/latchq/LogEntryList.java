@@ -1,5 +1,6 @@
 package io.github.cocosip.latchq;
 
+import java.io.Serial;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -8,6 +9,8 @@ import java.util.List;
  * the common "process the batch, then commit all positions" pattern.
  */
 public final class LogEntryList<T> extends ArrayList<LogEntry<T>> {
+
+    @Serial private static final long serialVersionUID = 1L;
 
     /** Extracts the position of every entry in this batch, in iteration order. */
     public List<Position> getPositions() {

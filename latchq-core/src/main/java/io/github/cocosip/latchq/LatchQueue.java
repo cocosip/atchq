@@ -40,8 +40,10 @@ public interface LatchQueue<T> extends AutoCloseable {
      * Reads up to {@code count} entries, blocking until at least one entry is available. Additional
      * entries are drained without waiting. Throws a {@code LatchQException} instead of hanging when
      * the queue is closed while waiting. An entry that cannot be deserialized throws a {@code
-     * LatchQDeserializationException} carrying its index range; skip it via {@link
-     * #forceCommitGap(long, long)} to keep consuming.
+     * LatchQDeserializationException} carrying its index range plus the entries of the same batch
+     * that were read before it: process and commit those via {@link
+     * LatchQDeserializationException#getSuccessfullyRead() getSuccessfullyRead()}, then skip the
+     * failed entry via {@link #forceCommitGap(long, long)} to keep consuming.
      */
     LogEntryList<T> read(int count);
 

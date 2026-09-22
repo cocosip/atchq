@@ -16,6 +16,15 @@ class TypeStorageNamingTest {
     }
 
     @Test
+    void defusesWindowsReservedNamesAndTrailingDotOrSpace() {
+        assertThat(TypeStorageNaming.sanitize("CON")).isEqualTo("_CON");
+        assertThat(TypeStorageNaming.sanitize("nul.txt")).isEqualTo("_nul.txt");
+        // trailing dots/spaces are stripped or rejected by Windows, so they become underscores
+        assertThat(TypeStorageNaming.sanitize("queue.")).isEqualTo("queue_");
+        assertThat(TypeStorageNaming.sanitize("queue ")).isEqualTo("queue_");
+    }
+
+    @Test
     void mapsEmptySegmentsToPlaceholder() {
         assertThat(TypeStorageNaming.sanitize("")).isEqualTo("_");
     }

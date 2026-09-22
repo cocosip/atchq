@@ -52,6 +52,35 @@ class LatchQueueOptionsTest {
     }
 
     @Test
+    void zeroEssentialBackgroundIntervalsFailValidation() {
+        LatchQueueOptions options = new LatchQueueOptions();
+        options.setRootPath("/data/latchq");
+        options.configure(
+                "events",
+                c -> {
+                    c.setFileName("events");
+                    // a zero interval would turn the background loop into a busy spin
+                    c.setCheckpointIntervalMillis(0);
+                });
+        assertThatThrownBy(options::validate)
+                .isInstanceOf(LatchQInvalidConfigurationException.class)
+                .hasMessageContaining("must be positive");
+    }
+
+    @Test
+    void zeroSyncIntervalRemainsLegalBecauseItDisablesPeriodicSyncing() {
+        LatchQueueOptions options = new LatchQueueOptions();
+        options.setRootPath("/data/latchq");
+        options.configure(
+                "events",
+                c -> {
+                    c.setFileName("events");
+                    c.setSyncIntervalMillis(0);
+                });
+        assertThatCode(options::validate).doesNotThrowAnyException();
+    }
+
+    @Test
     void unknownQueueNameFailsFastInsteadOfFallingBack() {
         LatchQueueOptions options = new LatchQueueOptions();
         options.setRootPath("/data/latchq");

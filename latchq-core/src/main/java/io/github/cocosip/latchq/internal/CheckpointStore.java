@@ -10,7 +10,6 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,8 +39,13 @@ public final class CheckpointStore {
         this.tempFile = queueDirectory.resolve("checkpoint.tmp");
     }
 
-    /** Atomically persists the truncate index and the empty-gap corrections. */
-    public void write(long truncateIndex, Map<Long, Long> corrections) throws IOException {
+    /**
+     * Atomically persists the truncate index and the empty-gap corrections. Guarded against
+     * concurrent writers (the checkpoint task and the final write of {@code close()} racing a
+     * timed-out shutdown join): both share the temp file, so overlapping writes could corrupt it.
+     */
+    public synchronized void write(long truncateIndex, Map<Long, Long> corrections)
+            throws IOException {
         Map<String, Object> document = new HashMap<>();
         document.put("truncate", truncateIndex);
         document.put("corrections", corrections);
@@ -82,9 +86,7 @@ public final class CheckpointStore {
             Map<Long, Long> corrections = new HashMap<>();
             JsonNode correctionsNode = root.get("corrections");
             if (correctionsNode != null && correctionsNode.isObject()) {
-                Iterator<Map.Entry<String, JsonNode>> fields = correctionsNode.fields();
-                while (fields.hasNext()) {
-                    Map.Entry<String, JsonNode> field = fields.next();
+                for (Map.Entry<String, JsonNode> field : correctionsNode.properties()) {
                     corrections.put(Long.parseLong(field.getKey()), field.getValue().asLong());
                 }
             }

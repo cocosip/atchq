@@ -40,13 +40,13 @@ public class LatchQueueConfiguration {
      */
     private int syncIntervalMillis = 2000;
 
-    /** Interval of the background range-merging (complete) task. */
+    /** Interval of the background range-merging (complete) task; must be positive. */
     private int completeIntervalMillis = 3000;
 
-    /** Interval of the background checkpoint persistence task. */
+    /** Interval of the background checkpoint persistence task; must be positive. */
     private int checkpointIntervalMillis = 2000;
 
-    /** Interval of the background cycle-file cleanup task. */
+    /** Interval of the background cycle-file cleanup task; must be positive. */
     private int cleanupIntervalMillis = 300000;
 
     /** Capacity of the bounded hand-off queue between the scan thread and consumers. */
@@ -73,17 +73,26 @@ public class LatchQueueConfiguration {
             throw new LatchQInvalidConfigurationException(
                     "fileName must be configured for the queue");
         }
-        if (maxMessageSizeBytes <= 0) {
-            throw new LatchQInvalidConfigurationException("maxMessageSizeBytes must be positive");
+        if (maxMessageSizeBytes <= 0 || maxMessageSizeBytes > Integer.MAX_VALUE) {
+            throw new LatchQInvalidConfigurationException(
+                    "maxMessageSizeBytes must be positive and not exceed "
+                            + Integer.MAX_VALUE
+                            + " (serialized payloads are byte arrays)");
         }
         if (rollCycle == null || rollCycle.isBlank()) {
             throw new LatchQInvalidConfigurationException("rollCycle must not be blank");
         }
-        if (syncIntervalMillis < 0
-                || completeIntervalMillis < 0
-                || checkpointIntervalMillis < 0
-                || cleanupIntervalMillis < 0) {
-            throw new LatchQInvalidConfigurationException("interval settings must not be negative");
+        if (syncIntervalMillis < 0) {
+            throw new LatchQInvalidConfigurationException(
+                    "syncIntervalMillis must not be negative");
+        }
+        if (completeIntervalMillis <= 0
+                || checkpointIntervalMillis <= 0
+                || cleanupIntervalMillis <= 0) {
+            // a zero interval would turn the respective background loop into a busy spin
+            throw new LatchQInvalidConfigurationException(
+                    "completeIntervalMillis, checkpointIntervalMillis and cleanupIntervalMillis"
+                            + " must be positive");
         }
         if (preReadCapacity <= 0) {
             throw new LatchQInvalidConfigurationException("preReadCapacity must be positive");

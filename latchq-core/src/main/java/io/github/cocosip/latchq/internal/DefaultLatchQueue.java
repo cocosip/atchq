@@ -32,7 +32,6 @@ import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import net.openhft.chronicle.queue.ChronicleQueue;
@@ -114,11 +113,15 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
     private final Set<ExcerptAppender> appenders = ConcurrentHashMap.newKeySet();
 
     /**
-     * Exports currently in flight. Cycle cleanup is suspended while one is running: an export may
-     * legitimately read cycles behind the persisted checkpoint (disaster recovery), and deleting
-     * those files mid-scan would truncate the export silently.
+     * Guards cycle cleanup against in-flight exports. An export may legitimately read cycles behind
+     * the persisted checkpoint (disaster recovery), and deleting those files mid-scan would
+     * truncate the export silently. An export holds the read lock for the whole scan; cleanup only
+     * deletes under a try-locked write lock, so a long export merely skips cleanup ticks. A lock
+     * (not a counter check) is required: checking a counter leaves a window in which cleanup has
+     * already passed the check while the export has not yet registered itself.
      */
-    private final AtomicInteger activeExports = new AtomicInteger();
+    private final java.util.concurrent.locks.ReentrantReadWriteLock cleanupSuspensionLock =
+            new java.util.concurrent.locks.ReentrantReadWriteLock();
 
     /** Bumped whenever the empty-gap corrections change, so idle checkpoints can be skipped. */
     private final AtomicLong correctionsVersion = new AtomicLong();
@@ -349,7 +352,22 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                         restore,
                         rollCycle);
             } catch (RuntimeException e) {
-                // release the directory guard so a retried initialize() is not locked out
+                // release the directory guard so a retried initialize() is not locked out, and
+                // stop a queue that was already built so it cannot leak file handles and
+                // background threads
+                this.running = false;
+                if (queue != null) {
+                    try {
+                        queue.close();
+                    } catch (RuntimeException closeError) {
+                        LOG.warn(
+                                "LatchQueue '{}' failed to close the queue of a failed"
+                                        + " initialize()",
+                                name,
+                                closeError);
+                    }
+                    this.queue = null;
+                }
                 OPEN_QUEUE_DIRECTORIES.remove(directoryKey);
                 this.openDirectoryKey = null;
                 throw e;
@@ -670,8 +688,14 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
         ensureUsable();
         LogEntryList<T> result = new LogEntryList<>();
         BufferedLogEntry first = takeOrThrow();
-        result.add(deserialize(first));
-        drainUpTo(result, count - 1);
+        try {
+            result.add(deserialize(first, result));
+            drainUpTo(result, count - 1);
+        } catch (LatchQDeserializationException e) {
+            // the prefix travels inside the exception; it was read from the queue either way
+            totalReadCount.add(result.size());
+            throw e;
+        }
         totalReadCount.add(result.size());
         return result;
     }
@@ -695,8 +719,14 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             return result;
         }
         first = checkCloseMarker(first);
-        result.add(deserialize(first));
-        drainUpTo(result, count - 1);
+        try {
+            result.add(deserialize(first, result));
+            drainUpTo(result, count - 1);
+        } catch (LatchQDeserializationException e) {
+            // the prefix travels inside the exception; it was read from the queue either way
+            totalReadCount.add(result.size());
+            throw e;
+        }
         totalReadCount.add(result.size());
         return result;
     }
@@ -736,11 +766,11 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                 pending.offer(CLOSE_MARKER);
                 return;
             }
-            result.add(deserialize(entry));
+            result.add(deserialize(entry, result));
         }
     }
 
-    private LogEntry<T> deserialize(BufferedLogEntry entry) {
+    private LogEntry<T> deserialize(BufferedLogEntry entry, List<LogEntry<T>> successfullyRead) {
         try {
             T data = objectMapper.readValue(entry.data(), type);
             return new LogEntry<>(data, entry.index(), entry.nextIndex());
@@ -762,7 +792,8 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
                             + type.getName(),
                     entry.index(),
                     entry.nextIndex(),
-                    e);
+                    e,
+                    List.copyOf(successfullyRead));
         }
     }
 
@@ -1099,34 +1130,38 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
      * briefly after close) are tolerated and retried on the next tick.
      */
     private void cleanupCycleFiles() {
-        if (activeExports.get() > 0) {
+        if (!cleanupSuspensionLock.writeLock().tryLock()) {
             return; // an export may be reading behind the checkpoint; never delete under it
         }
-        long persisted = persistedTruncate.get();
-        if (persisted < 0) {
-            return; // nothing persisted yet: never delete based on memory state alone
-        }
-        int checkpointCycle = rollCycle().toCycle(persisted);
-        for (Map.Entry<Integer, java.io.File> entry : acquiredCycleFiles.entrySet()) {
-            int cycle = entry.getKey();
-            if (cycle >= checkpointCycle) {
-                continue;
+        try {
+            long persisted = persistedTruncate.get();
+            if (persisted < 0) {
+                return; // nothing persisted yet: never delete based on memory state alone
             }
-            java.io.File file = entry.getValue();
-            try {
-                Files.delete(file.toPath());
-                acquiredCycleFiles.remove(cycle);
-                LOG.info(
-                        "LatchQueue '{}' deleted consumed cycle file {} (cycle {})",
-                        name,
-                        file,
-                        cycle);
-            } catch (IOException e) {
-                // transient lock, retried on the next tick
-                LOG.debug("LatchQueue '{}' could not delete cycle file {} yet", name, file, e);
+            int checkpointCycle = rollCycle().toCycle(persisted);
+            for (Map.Entry<Integer, java.io.File> entry : acquiredCycleFiles.entrySet()) {
+                int cycle = entry.getKey();
+                if (cycle >= checkpointCycle) {
+                    continue;
+                }
+                java.io.File file = entry.getValue();
+                try {
+                    Files.delete(file.toPath());
+                    acquiredCycleFiles.remove(cycle);
+                    LOG.info(
+                            "LatchQueue '{}' deleted consumed cycle file {} (cycle {})",
+                            name,
+                            file,
+                            cycle);
+                } catch (IOException e) {
+                    // transient lock, retried on the next tick
+                    LOG.debug("LatchQueue '{}' could not delete cycle file {} yet", name, file, e);
+                }
             }
+            cleanupUnopenedFiles(checkpointCycle);
+        } finally {
+            cleanupSuspensionLock.writeLock().unlock();
         }
-        cleanupUnopenedFiles(checkpointCycle);
     }
 
     /**
@@ -1231,8 +1266,8 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             return new ExportResult(filePaths, 0, actualFrom, actualFrom);
         }
         // an export may be reading cycles behind the persisted checkpoint (disaster recovery);
-        // suspend cleanup for the duration so those files cannot be deleted mid-scan
-        activeExports.incrementAndGet();
+        // hold the read lock for the whole scan so cleanup cannot delete those files mid-scan
+        cleanupSuspensionLock.readLock().lock();
         try {
             try {
                 Files.createDirectories(Path.of(targetDirectory));
@@ -1314,7 +1349,7 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
             long resultTo = count == 0 ? actualFrom : lastReadIndex + 1;
             return new ExportResult(filePaths, count, actualFrom, resultTo);
         } finally {
-            activeExports.decrementAndGet();
+            cleanupSuspensionLock.readLock().unlock();
         }
     }
 
@@ -1331,6 +1366,14 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
     @Override
     public long lastIndexAppended() {
         ensureUsable();
+        return lastIndexInternal();
+    }
+
+    /**
+     * Reads the last index without a lifecycle check: {@link #metrics()} promises to be callable in
+     * any lifecycle state, so it must not race a {@code close()} into a usability exception.
+     */
+    private long lastIndexInternal() {
         long first = safeFirstIndex();
         if (first < 0) {
             return -1;
@@ -1354,7 +1397,7 @@ public final class DefaultLatchQueue<T> implements LatchQueue<T> {
         // the right guard, because initialize() assigns the queue field before flipping the flag.
         boolean usable = initialized && !closed;
         long first = usable ? safeFirstIndex() : -1;
-        long last = usable ? lastIndexAppended() : -1;
+        long last = usable ? lastIndexInternal() : -1;
         rangesLock.lock();
         int rangeCount;
         try {
